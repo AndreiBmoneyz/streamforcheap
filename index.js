@@ -78,7 +78,7 @@ app.get('/', (req, res) => {
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>StreamForCheap — 24/7 YouTube Streaming for $5/month</title>
+<title>StreamForCheap — 24/7 YouTube Streaming for $2/month</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0;}
   :root{--bg:#0a0a0a;--surface:#111;--surface2:#1a1a1a;--border:rgba(255,255,255,0.08);--text:#fff;--muted:#888;--accent:#aaff00;--accent-dim:rgba(170,255,0,0.1);--accent-dim2:rgba(170,255,0,0.05);}
