@@ -232,7 +232,24 @@ function startFFmpeg(streamId, streamData) {
     const proc = spawn('ffmpeg', args);
     const entry = { proc, restarting: false, streamData: { ...streamData } };
     activeStreams.set(streamId, entry);
-    proc.stderr.on('data', () => {});
+    proc.stderr.on('data', (data) => {
+  const msg = data.toString();
+  if (
+    msg.includes('Connection refused') ||
+    msg.includes('broken pipe') ||
+    msg.includes('Failed to update header') ||
+    msg.includes('Error writing trailer') ||
+    msg.includes('Connection reset by peer') ||
+    msg.includes('RTMP_SendPacket') ||
+    msg.includes('Server error')
+  ) {
+    const cur = activeStreams.get(streamId);
+    if (cur && !cur.restarting) {
+      cur.restarting = true;
+      try { cur.proc.kill('SIGKILL'); } catch(e) {}
+    }
+  }
+});
     proc.on('close', () => {
       const current = activeStreams.get(streamId);
       if (current && !current.restarting) {
