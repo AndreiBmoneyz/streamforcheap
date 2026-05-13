@@ -165,38 +165,11 @@ function buildFFmpegArgs(stream) {
 
   // ── Video / Image input ──────────────────────────────────────────────────
   if (isImage) {
-    // Static image: use wall clock as timestamp source so the stream clock
-    // is always anchored to real time — no drift possible.
-    args.push(
-      '-re',
-      '-thread_queue_size', '512',
-      '-use_wallclock_as_timestamps', '1',
-      '-loop', '1',
-      '-framerate', '30',
-      '-i', stream.file_path
-    );
+    args.push('-thread_queue_size', '512', '-loop', '1', '-framerate', '30', '-i', stream.file_path);
   } else if (isGif) {
-    // GIF: same wall-clock trick; GIFs have unreliable internal timestamps.
-    args.push(
-      '-re',
-      '-thread_queue_size', '512',
-      '-use_wallclock_as_timestamps', '1',
-      '-ignore_loop', '0',
-      '-stream_loop', '-1',
-      '-i', stream.file_path
-    );
+    args.push('-thread_queue_size', '512', '-ignore_loop', '0', '-stream_loop', '-1', '-i', stream.file_path);
   } else {
-    // Video: -re enforces real-time pacing. -stream_loop -1 loops forever.
-    // -fflags +genpts regenerates PTS from DTS when missing (common in some
-    // containers) but we do NOT use +igndts anymore — ignoring DTS caused
-    // slow timestamp drift as errors accumulated across loop boundaries.
-    args.push(
-      '-re',
-      '-thread_queue_size', '512',
-      '-fflags', '+genpts',
-      '-stream_loop', '-1',
-      '-i', stream.file_path
-    );
+    args.push('-thread_queue_size', '512', '-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
   }
 
   // ── Audio track inputs ───────────────────────────────────────────────────
