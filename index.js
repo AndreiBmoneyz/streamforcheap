@@ -147,12 +147,12 @@ function buildFFmpegArgs(stream) {
   } else if (isGif) {
     args.push('-thread_queue_size', '512', '-re', '-ignore_loop', '0', '-stream_loop', '-1', '-i', stream.file_path);
   } else {
-    args.push('-thread_queue_size', '512', '-re', '-stream_loop', '-1', '-i', stream.file_path);
+    args.push('-thread_queue_size', '4096', '-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
   }
 
   // ── Audio track inputs ───────────────────────────────────────────────────
   for (const t of tracks) {
-    args.push('-thread_queue_size', '512', '-stream_loop', '-1', '-i', t.path);
+    args.push('-thread_queue_size', '4096', '-stream_loop', '-1', '-i', t.path);
   }
 
   // ── Video encoding ───────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ function buildFFmpegArgs(stream) {
     '-maxrate', bitrate,
     '-bufsize', bufsize,
     '-pix_fmt', 'yuv420p',
-    '-vf', `loop=-1:size=32767,${vf}`,
+    '-vf', vf,
     '-x264-params', 'nal-hrd=cbr:force-cfr=1',
     '-max_muxing_queue_size', '1024'
   );
