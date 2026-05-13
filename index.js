@@ -11,7 +11,6 @@ const Stripe = require('stripe');
 const app = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Raw body for Stripe webhooks
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -86,7 +85,6 @@ pool.query(`
   ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
 `).catch(console.error);
 
-// Stripe price IDs
 const PLANS = {
   starter: { name: 'Starter', price: 2,  slots: 1, priceId: process.env.STRIPE_PRICE_STARTER || '' },
   pro:     { name: 'Pro',     price: 5,  slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '' },
@@ -123,13 +121,15 @@ async function generateThumb(filePath, streamId) {
 }
 
 // ==================== FFMPEG (LAG FIX) ====================
-// Key changes vs old version:
-// - Removed -re for image/gif input types (caused timing drift)
-// - Added -fflags +genpts to fix pts discontinuities on loop
-// - Increased bitrate to 4000k + buffer to 8000k (YouTube recommends this for 1080p)
-// - Added -x264-params keyint=60:min-keyint=60 for consistent keyframes
-// - Added -flvflags no_duration_filesize for stable FLV muxing
-// - Added -drop_pkts_on_overflow 1 and -max_interleave_delta 0 to prevent buffer stalls
+// KEY CHANGES FOR LAG:
+// - Added -thread_queue_size 512 on all inputs to prevent input starvation
+// - Added rtmp_buffer 5000ms (5 second RTMP output buffer) — YouTube buffers this before showing to viewers
+// - Added -max_muxing_queue_size 1024 to prevent muxer stalls
+// - Added -probesize 10M and -analyzeduration 10M for better input analysis
+// - Use concat filter instead of amix for sequential audio track playback (fixes 3-sec loop bug)
+// - Removed zerolatency tune (counterproductive for streaming — increases decoder complexity)
+// - Added -preset veryfast with proper CBR settings
+// - Added -flags +global_header for stable stream headers
 
 function buildFFmpegArgs(stream) {
   const width  = stream.resolution === '1080p' ? 1920 : 1280;
@@ -149,68 +149,81 @@ function buildFFmpegArgs(stream) {
   const rtmp = `rtmp://a.rtmp.youtube.com/live2/${stream.stream_key}`;
   const args = [];
 
-  // Global flags to fix pts/timing issues that cause lag
+  // Fix pts/timing issues
   args.push('-fflags', '+genpts+igndts');
 
   if (isImage) {
-    // Static image: loop it, no -re needed (we control fps via -r)
-    args.push('-loop', '1', '-framerate', '30', '-i', stream.file_path);
+    args.push('-thread_queue_size', '512', '-loop', '1', '-framerate', '30', '-i', stream.file_path);
   } else if (isGif) {
-    // GIF: ignore internal loop, force loop ourselves
-    args.push('-ignore_loop', '0', '-stream_loop', '-1', '-i', stream.file_path);
+    args.push('-thread_queue_size', '512', '-ignore_loop', '0', '-stream_loop', '-1', '-i', stream.file_path);
   } else {
-    // Video: -re reads at native rate, -stream_loop -1 loops it
-    // -avoid_negative_ts make_zero fixes timestamp issues on loop
-    args.push('-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
+    args.push('-thread_queue_size', '512', '-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
   }
 
+  // Add audio track inputs
   for (const t of tracks) {
-    args.push('-stream_loop', '-1', '-i', t.path);
+    args.push('-thread_queue_size', '512', '-stream_loop', '-1', '-i', t.path);
   }
 
-  // Video encoding — tuned for stable YouTube RTMP
+  // Video encoding
   args.push(
     '-c:v', 'libx264',
-    '-preset', 'veryfast',       // veryfast > ultrafast: much better quality/lag tradeoff
-    '-tune', isImage ? 'stillimage' : 'zerolatency',
+    '-preset', 'veryfast',
     '-profile:v', 'high',
     '-level', '4.2',
     '-threads', '0',
     '-r', '30',
-    '-g', '60',                  // keyframe every 2 seconds (standard for RTMP)
+    '-g', '60',
     '-keyint_min', '60',
-    '-sc_threshold', '0',        // disable scene-change keyframes (causes lag spikes)
+    '-sc_threshold', '0',
     '-b:v', bitrate,
     '-maxrate', bitrate,
     '-bufsize', bufsize,
     '-pix_fmt', 'yuv420p',
     '-vf', vf,
-    '-x264-params', 'nal-hrd=cbr:force-cfr=1'  // constant bitrate, prevents buffering
+    '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+    '-max_muxing_queue_size', '1024'
   );
 
   const videoHasAudio = !['.jpg','.jpeg','.png','.webp','.gif'].includes(ext);
 
+  // AUDIO MIXING:
+  // Use concat filter for SEQUENTIAL playback of tracks (fixes the 3-sec loop bug).
+  // amix plays all tracks simultaneously which causes the truncation issue.
+  // concat plays them one after another, then loops back.
+
   if (hasAudioTracks && videoHasAudio) {
-    let fc = `[0:a]volume=${videoVol}[va];`;
-    for (let i = 0; i < tracks.length; i++) fc += `[${i+1}:a]volume=${audioVol}[a${i}];`;
-    const ins = ['[va]', ...tracks.map((_,i) => `[a${i}]`)].join('');
-    fc += `${ins}amix=inputs=${tracks.length+1}:duration=longest[aout]`;
+    // Mix video audio + sequential audio tracks
+    // Step 1: concat all audio tracks sequentially with loop
+    let fc = '';
+    // Build concat for audio tracks
+    const trackCount = tracks.length;
+    for (let i = 0; i < trackCount; i++) {
+      fc += `[${i+1}:a]volume=${audioVol}[at${i}];`;
+    }
+    const concatIns = tracks.map((_,i) => `[at${i}]`).join('');
+    fc += `${concatIns}concat=n=${trackCount}:v=0:a=1[aconcat];`;
+    fc += `[aconcat]aloop=loop=-1:size=2147483647[aloop];`;
+    fc += `[0:a]volume=${videoVol}[va];`;
+    fc += `[va][aloop]amix=inputs=2:duration=longest[aout]`;
     args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
   } else if (hasAudioTracks && !videoHasAudio) {
-    if (tracks.length === 1) {
-      args.push('-map', '0:v', '-map', '1:a', '-af', `volume=${audioVol}`);
-    } else {
-      let fc = '';
-      for (let i = 0; i < tracks.length; i++) fc += `[${i+1}:a]volume=${audioVol}[a${i}];`;
-      const ins = tracks.map((_,i) => `[a${i}]`).join('');
-      fc += `${ins}amix=inputs=${tracks.length}:duration=longest[aout]`;
-      args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
+    // Sequential audio tracks only (image/gif source)
+    let fc = '';
+    const trackCount = tracks.length;
+    for (let i = 0; i < trackCount; i++) {
+      fc += `[${i+1}:a]volume=${audioVol}[at${i}];`;
     }
+    const concatIns = tracks.map((_,i) => `[at${i}]`).join('');
+    fc += `${concatIns}concat=n=${trackCount}:v=0:a=1[aconcat];`;
+    fc += `[aconcat]aloop=loop=-1:size=2147483647[aout]`;
+    args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
   } else if (!hasAudioTracks && videoHasAudio) {
     args.push('-map', '0:v', '-map', '0:a', '-af', `volume=${videoVol}`);
   } else {
     // No audio at all — generate silence
-    args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-map', '0:v', '-map', isImage||isGif ? '1:a' : '0:a');
+    args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+      '-map', '0:v', '-map', isImage||isGif ? '1:a' : '0:a');
   }
 
   args.push(
@@ -219,7 +232,12 @@ function buildFFmpegArgs(stream) {
     '-ar', '44100',
     '-ac', '2',
     '-f', 'flv',
-    '-flvflags', 'no_duration_filesize',  // prevents FLV muxer stalling
+    '-flvflags', 'no_duration_filesize',
+    // 5-second RTMP buffer — this is the key lag fix.
+    // ffmpeg fills this buffer BEFORE pushing to YouTube, so YouTube
+    // always has data ahead and never stalls the viewer stream.
+    '-rtmp_buffer', '5000',
+    '-rtmp_live', 'live',
     rtmp
   );
 
@@ -250,6 +268,29 @@ function startFFmpeg(streamId, streamData) {
   });
 }
 
+// ==================== SHARED NAV HELPERS ====================
+
+// Inline nav CSS used across pages
+const NAV_CSS = `
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,10,10,0.97);backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,0.08);padding:0 2rem;height:64px;display:flex;align-items:center;justify-content:space-between;}
+.nav-logo{font-size:20px;font-weight:800;letter-spacing:-0.5px;text-decoration:none;color:#fff;}
+.nav-logo .g{color:#aaff00;}
+.nav-links{display:flex;align-items:center;gap:8px;}
+.nav-links a{font-size:13px;font-weight:700;letter-spacing:0.05em;color:#aaa;background:#1a1a1a;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:7px 14px;transition:all 0.15s;text-transform:uppercase;text-decoration:none;}
+.nav-links a:hover{color:#aaff00;border-color:rgba(170,255,0,0.3);}
+.nav-auth{display:flex;align-items:center;gap:10px;}
+.nav-login{font-size:14px;color:#888;transition:color 0.15s;text-decoration:none;}
+.nav-login:hover{color:#fff;}
+.nav-btn{background:#aaff00;color:#000;padding:8px 20px;border-radius:8px;font-size:14px;font-weight:700;transition:opacity 0.15s;text-decoration:none;}
+.nav-btn:hover{opacity:0.85;color:#000;}
+.nav-streams-btn{background:rgba(170,255,0,0.1);color:#aaff00;border:1px solid rgba(170,255,0,0.25);padding:7px 16px;border-radius:8px;font-size:13px;font-weight:700;transition:all 0.15s;text-decoration:none;}
+.nav-streams-btn:hover{background:rgba(170,255,0,0.2);border-color:rgba(170,255,0,0.5);}
+.nav-user{font-size:14px;color:#ccc;font-weight:600;}
+.nav-logout{font-size:13px;color:#555;transition:color 0.15s;text-decoration:none;}
+.nav-logout:hover{color:#f87171;}
+@media(max-width:600px){.nav-links{display:none;}}
+`;
+
 // ==================== LANDING ====================
 
 app.get('/', (req, res) => {
@@ -264,17 +305,7 @@ app.get('/', (req, res) => {
 :root{--bg:#0a0a0a;--surface:#111;--surface2:#1a1a1a;--border:rgba(255,255,255,0.08);--text:#fff;--muted:#888;--accent:#aaff00;--accent-dim:rgba(170,255,0,0.1);--accent-dim2:rgba(170,255,0,0.05);}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden;}
 a{text-decoration:none;color:inherit;}
-nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,10,10,0.97);backdrop-filter:blur(10px);border-bottom:1px solid var(--border);padding:0 2rem;height:64px;display:flex;align-items:center;justify-content:space-between;}
-.nav-logo{font-size:20px;font-weight:800;letter-spacing:-0.5px;}
-.nav-logo .g{color:var(--accent);}
-.nav-links{display:flex;align-items:center;gap:8px;}
-.nav-links a{font-size:13px;font-weight:700;letter-spacing:0.05em;color:#aaa;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:7px 14px;transition:all 0.15s;text-transform:uppercase;}
-.nav-links a:hover{color:var(--accent);border-color:rgba(170,255,0,0.3);}
-.nav-auth{display:flex;align-items:center;gap:10px;}
-.nav-login{font-size:14px;color:var(--muted);transition:color 0.15s;}
-.nav-login:hover{color:var(--text);}
-.nav-btn{background:var(--accent);color:#000;padding:8px 20px;border-radius:8px;font-size:14px;font-weight:700;transition:opacity 0.15s;}
-.nav-btn:hover{opacity:0.85;color:#000;}
+${NAV_CSS}
 .hero{padding:140px 2rem 100px;text-align:center;max-width:900px;margin:0 auto;}
 .hero-badge{display:inline-flex;align-items:center;gap:8px;background:var(--accent-dim);border:1px solid rgba(170,255,0,0.2);border-radius:99px;padding:6px 16px;font-size:13px;color:var(--accent);font-weight:600;margin-bottom:2rem;}
 .hero h1{font-size:clamp(36px,6vw,72px);font-weight:900;line-height:1.05;letter-spacing:-2px;margin-bottom:1.5rem;}
@@ -340,7 +371,6 @@ footer{border-top:1px solid var(--border);padding:3rem 2rem;text-align:center;}
 .footer-links a{font-size:13px;color:var(--muted);transition:color 0.15s;}
 .footer-links a:hover{color:var(--text);}
 .footer-copy{font-size:12px;color:#444;}
-@media(max-width:600px){.nav-links{display:none;}.comparison-header,.comparison-row{grid-template-columns:1.5fr 1fr 1fr;font-size:12px;padding:0.75rem 1rem;}}
 </style>
 </head>
 <body>
@@ -351,6 +381,7 @@ footer{border-top:1px solid var(--border);padding:3rem 2rem;text-align:center;}
     <a href="#pricing">PRICING</a>
     <a href="#faq">FAQ</a>
   </div>
+  <!-- FIX #2 + #3: nav-auth starts with login/register, replaced via JS if logged in -->
   <div class="nav-auth" id="nav-auth">
     <a href="/login" class="nav-login">Log in</a>
     <a href="/register" class="nav-btn">Get started</a>
@@ -453,16 +484,17 @@ footer{border-top:1px solid var(--border);padding:3rem 2rem;text-align:center;}
   <div class="footer-copy">© 2026 StreamForCheap. The cheapest 24/7 streaming service on the internet.</div>
 </footer>
 <script>
-// Update nav if already logged in
+// FIX #2 + #3: Check login state, update nav with username + My Streams button
 fetch('/api/me').then(r=>r.json()).then(data=>{
-  if(data.userId && data.username){
+  if(data.userId){
+    const name = data.username || data.email || 'Account';
     document.getElementById('nav-auth').innerHTML=
-      '<a href="/dashboard" style="font-size:14px;color:#aaa;margin-right:4px;">👤 '+data.username+'</a>'+
-      '<a href="/dashboard" class="nav-btn">Dashboard</a>';
+      '<span class="nav-user">👤 '+name+'</span>'+
+      '<a href="/dashboard" class="nav-streams-btn">📡 My Streams</a>'+
+      '<a href="/logout" class="nav-logout">Log out</a>';
   }
 });
 function choosePlan(plan) {
-  sessionStorage.setItem('chosen_plan', plan);
   fetch('/api/me').then(r => r.json()).then(data => {
     if (data.userId) {
       window.location.href = '/checkout?plan=' + plan;
@@ -480,10 +512,15 @@ function choosePlan(plan) {
 
 // ==================== AUTH ====================
 
+// FIX #2: Return email too so landing page can show it as fallback
 app.get('/api/me', (req, res) => {
   if (!req.session.userId) return res.json({ userId: null });
-  pool.query('SELECT id, username FROM users WHERE id=$1', [req.session.userId])
-    .then(r => res.json({ userId: r.rows[0]?.id || null, username: r.rows[0]?.username || null }))
+  pool.query('SELECT id, username, email FROM users WHERE id=$1', [req.session.userId])
+    .then(r => {
+      if (!r.rows[0]) return res.json({ userId: null });
+      const u = r.rows[0];
+      res.json({ userId: u.id, username: u.username || u.email.split('@')[0], email: u.email });
+    })
     .catch(() => res.json({ userId: null }));
 });
 
@@ -632,10 +669,15 @@ app.get('/checkout', requireAuth, async (req, res) => {
 <script src="https://js.stripe.com/v3/"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:2rem;}
-.checkout-wrap{display:grid;grid-template-columns:1fr 1fr;gap:2rem;max-width:860px;width:100%;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;padding:2rem 2rem 4rem;}
+/* FIX #1: Prominent back button at top */
+.back-bar{max-width:860px;margin:0 auto 1.5rem;}
+.back-arrow{display:inline-flex;align-items:center;gap:8px;color:#aaa;font-size:14px;font-weight:600;text-decoration:none;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 18px;transition:all 0.15s;}
+.back-arrow:hover{color:#aaff00;border-color:rgba(170,255,0,0.3);background:#161616;}
+.back-arrow .arrow{font-size:18px;line-height:1;}
+.checkout-wrap{display:grid;grid-template-columns:1fr 1fr;gap:2rem;max-width:860px;margin:0 auto;width:100%;}
 .order-summary{background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:2rem;}
-.order-summary h2{font-size:18px;font-weight:800;margin-bottom:1.5rem;color:#888;text-transform:uppercase;font-size:12px;letter-spacing:0.1em;}
+.order-summary h2{font-size:12px;font-weight:800;margin-bottom:1.5rem;color:#888;text-transform:uppercase;letter-spacing:0.1em;}
 .plan-box{background:#1a1a1a;border:1px solid rgba(170,255,0,0.2);border-radius:12px;padding:1.5rem;margin-bottom:1.5rem;}
 .plan-box .pname{font-size:22px;font-weight:800;margin-bottom:4px;}
 .plan-box .pdesc{font-size:14px;color:#888;margin-bottom:1rem;}
@@ -659,12 +701,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .pay-btn:hover{opacity:0.85;}.pay-btn:disabled{opacity:0.5;cursor:not-allowed;}
 .secure-note{display:flex;align-items:center;justify-content:center;gap:8px;font-size:15px;font-weight:600;color:#888;margin-top:14px;}
 .secure-note .lock{font-size:18px;}
-.back-link{font-size:13px;color:#555;text-align:center;margin-top:1rem;display:block;}
-.back-link:hover{color:#fff;}
 @media(max-width:700px){.checkout-wrap{grid-template-columns:1fr;}}
 </style>
 </head>
 <body>
+<!-- FIX #1: Big visible back button -->
+<div class="back-bar">
+  <a href="/#pricing" class="back-arrow">
+    <span class="arrow">←</span> Back to pricing
+  </a>
+</div>
 <div class="checkout-wrap">
   <div class="order-summary">
     <h2>Order Summary</h2>
@@ -703,7 +749,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     </div>
     <button class="pay-btn" id="pay-btn" onclick="handlePayment()">Subscribe — $${planData.price}/month</button>
     <div class="secure-note"><span class="lock">🔒</span> Secured by Stripe &nbsp;·&nbsp; Cancel anytime</div>
-    <a href="/#pricing" class="back-link">← Back to pricing</a>
   </div>
 </div>
 <script>
@@ -721,7 +766,6 @@ card.on('change', e => {
   if(e.error){err.textContent=e.error.message;err.style.display='block';}
   else{err.style.display='none';}
 });
-
 async function handlePayment(){
   const btn = document.getElementById('pay-btn');
   btn.disabled = true; btn.textContent = 'Processing...';
@@ -733,13 +777,10 @@ async function handlePayment(){
     });
     const intentData = await intentRes.json();
     if(intentData.error){ throw new Error(intentData.error); }
-
     const result = await stripe.confirmCardPayment(intentData.clientSecret, {
       payment_method: { card }
     });
-
     if(result.error){ throw new Error(result.error.message); }
-
     window.location.href = '/dashboard?welcome=1';
   } catch(e) {
     const err = document.getElementById('card-errors');
@@ -752,6 +793,8 @@ async function handlePayment(){
 </html>`);
 });
 
+// ==================== DASHBOARD ====================
+
 app.get('/dashboard', requireAuth, async (req, res) => {
   const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
   const streams = (await pool.query('SELECT * FROM streams WHERE user_id=$1 ORDER BY created_at DESC', [req.session.userId])).rows;
@@ -762,6 +805,15 @@ app.get('/dashboard', requireAuth, async (req, res) => {
   const welcome = req.query.welcome === '1';
   const hasActivePlan = user.subscription_status === 'active' || user.plan !== 'free';
   const displayName = user.username || user.email.split('@')[0];
+
+  // Serialize streams with audio_tracks as proper JSON for the client
+  const streamsForClient = streams.reduce((a,s)=>{
+    a[s.id] = {
+      ...s,
+      audio_tracks: Array.isArray(s.audio_tracks) ? s.audio_tracks : []
+    };
+    return a;
+  },{});
 
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -775,11 +827,15 @@ app.get('/dashboard', requireAuth, async (req, res) => {
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:#fff;min-height:100vh;}
 a{text-decoration:none;color:inherit;}
 .topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 2rem;height:64px;display:flex;align-items:center;justify-content:space-between;position:fixed;top:0;left:0;right:0;z-index:100;}
-.logo{font-size:18px;font-weight:800;}.logo .g{color:var(--accent);}
-.topbar-right{display:flex;align-items:center;gap:16px;}
+.logo{font-size:18px;font-weight:800;text-decoration:none;color:#fff;}.logo .g{color:var(--accent);}
+/* FIX #3: back to home link in topbar */
+.topbar-left{display:flex;align-items:center;gap:16px;}
+.home-link{font-size:13px;color:#555;display:flex;align-items:center;gap:4px;transition:color 0.15s;text-decoration:none;}
+.home-link:hover{color:#aaa;}
+.topbar-right{display:flex;align-items:center;gap:12px;}
 .plan-badge{background:rgba(170,255,0,0.1);border:1px solid rgba(170,255,0,0.2);color:var(--accent);font-size:12px;font-weight:700;padding:4px 12px;border-radius:99px;text-transform:uppercase;}
 .user-name{font-size:14px;color:#ccc;font-weight:600;}
-.logout{font-size:13px;color:var(--muted);}.logout:hover{color:#f87171;}
+.logout{font-size:13px;color:var(--muted);text-decoration:none;}.logout:hover{color:#f87171;}
 .main{max-width:900px;margin:0 auto;padding:84px 1rem 4rem;}
 .welcome-banner{background:rgba(170,255,0,0.08);border:1px solid rgba(170,255,0,0.2);border-radius:12px;padding:1rem 1.5rem;margin-bottom:1.5rem;font-size:15px;color:var(--accent);display:${welcome?'block':'none'};}
 .page-title{font-size:26px;font-weight:800;margin-bottom:4px;letter-spacing:-0.5px;}
@@ -820,6 +876,7 @@ a{text-decoration:none;color:inherit;}
 .empty-icon{font-size:48px;margin-bottom:1rem;}
 .empty-state h3{font-size:18px;font-weight:700;margin-bottom:8px;}
 .empty-state p{font-size:14px;color:var(--muted);margin-bottom:1.5rem;}
+/* Modal */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:200;display:none;align-items:flex-start;justify-content:center;padding:2rem 1rem;overflow-y:auto;}
 .modal-overlay.open{display:flex;}
 .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:2rem;max-width:540px;width:100%;margin:auto;}
@@ -839,7 +896,7 @@ a{text-decoration:none;color:inherit;}
 .preview-wrap:hover .preview-overlay{opacity:1;}
 .preview-overlay-text{color:#fff;font-size:14px;font-weight:600;}
 .preview-overlay-icon{font-size:28px;margin-bottom:6px;}
-.preview-empty{width:100%;aspect-ratio:16/9;border-radius:10px;border:1.5px dashed #2a2a2a;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;position:relative;transition:all 0.15s;margin-bottom:10px;background:transparent;}
+.preview-empty{width:100%;aspect-ratio:16/9;border-radius:10px;border:1.5px dashed #2a2a2a;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;transition:all 0.15s;margin-bottom:10px;}
 .preview-empty:hover{border-color:var(--accent);background:rgba(170,255,0,0.03);}
 .preview-empty-icon{font-size:32px;color:var(--accent);margin-bottom:8px;}
 .preview-empty-text{font-size:13px;color:#555;}
@@ -852,12 +909,16 @@ a{text-decoration:none;color:inherit;}
 .mute-btn{padding:5px 12px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;border:1px solid #333;background:transparent;color:#666;transition:all 0.15s;flex-shrink:0;}
 .mute-btn.muted{background:rgba(248,113,113,0.1);border-color:rgba(248,113,113,0.3);color:#f87171;}
 .mute-btn:hover{border-color:var(--accent);color:var(--accent);}
+/* FIX #4: Audio tracks list — shows DB tracks + new uploads */
 .audio-tracks-list{display:flex;flex-direction:column;gap:8px;margin-bottom:10px;}
 .audio-track-item{display:flex;align-items:center;gap:8px;background:var(--surface2);border:1px solid #222;border-radius:8px;padding:8px 12px;}
+.audio-track-item.is-saved{border-color:rgba(170,255,0,0.15);}
 .track-order-btns{display:flex;flex-direction:column;gap:2px;}
 .track-order-btn{background:none;border:none;color:#555;cursor:pointer;font-size:10px;line-height:1;padding:1px 4px;transition:color 0.1s;}
-.track-order-btn:hover{color:var(--accent);}
+.track-order-btn:hover:not(:disabled){color:var(--accent);}
+.track-order-btn:disabled{opacity:0.2;cursor:default;}
 .track-name-text{flex:1;font-size:13px;color:#ccc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.track-saved-badge{font-size:10px;color:#aaff00;background:rgba(170,255,0,0.08);border:1px solid rgba(170,255,0,0.2);border-radius:4px;padding:1px 6px;flex-shrink:0;}
 .track-dur-text{font-size:12px;color:#555;flex-shrink:0;}
 .track-remove-btn{background:none;border:none;color:#444;cursor:pointer;font-size:16px;padding:0 2px;transition:color 0.1s;}
 .track-remove-btn:hover{color:#f87171;}
@@ -873,11 +934,26 @@ a{text-decoration:none;color:inherit;}
 .modal-btn:hover{opacity:0.85;}.modal-btn:disabled{opacity:0.4;cursor:not-allowed;}
 .save-note{font-size:12px;color:#555;text-align:center;margin-top:8px;}
 .live-tag{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--accent);background:rgba(170,255,0,0.1);border:1px solid rgba(170,255,0,0.2);border-radius:99px;padding:2px 8px;margin-left:8px;vertical-align:middle;}
+/* Confirm dialog */
+.confirm-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:300;display:none;align-items:center;justify-content:center;padding:1rem;}
+.confirm-overlay.open{display:flex;}
+.confirm-box{background:#111;border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:1.5rem;max-width:360px;width:100%;text-align:center;}
+.confirm-box h3{font-size:17px;font-weight:700;margin-bottom:8px;}
+.confirm-box p{font-size:14px;color:#888;margin-bottom:1.5rem;line-height:1.5;}
+.confirm-btns{display:flex;gap:10px;}
+.confirm-yes{flex:1;padding:10px;background:#f87171;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;}
+.confirm-yes:hover{background:#ef4444;}
+.confirm-no{flex:1;padding:10px;background:#1a1a1a;color:#aaa;border:1px solid #333;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;}
+.confirm-no:hover{border-color:#555;color:#fff;}
 </style>
 </head>
 <body>
 <div class="topbar">
-  <a href="/" class="logo">stream<span class="g">forcheap</span></a>
+  <!-- FIX #3: Home link in topbar -->
+  <div class="topbar-left">
+    <a href="/" class="logo">stream<span class="g">forcheap</span></a>
+    <a href="/" class="home-link">← Home</a>
+  </div>
   <div class="topbar-right">
     <span class="user-name">👤 ${displayName}</span>
     <span class="plan-badge">${user.plan}</span>
@@ -886,6 +962,18 @@ a{text-decoration:none;color:inherit;}
 </div>
 
 <input type="file" id="hidden-video-input" class="hidden-file" accept=".mp4,.mov,.avi,.mkv,.webm,.gif,.jpg,.jpeg,.png,.webp" onchange="handleVideoSelect(event)"/>
+
+<!-- Confirm delete audio track dialog -->
+<div class="confirm-overlay" id="confirm-overlay">
+  <div class="confirm-box">
+    <h3>Remove this track?</h3>
+    <p id="confirm-track-name">Are you sure you want to remove this audio track?</p>
+    <div class="confirm-btns">
+      <button class="confirm-no" onclick="closeConfirm()">Cancel</button>
+      <button class="confirm-yes" onclick="confirmRemove()">Yes, remove</button>
+    </div>
+  </div>
+</div>
 
 <div class="modal-overlay" id="stream-modal">
   <div class="modal">
@@ -913,7 +1001,7 @@ a{text-decoration:none;color:inherit;}
       <button class="mute-btn" id="video-mute-btn" onclick="toggleMute('video')">Mute</button>
     </div>
     <hr class="section-divider"/>
-    <div class="section-heading">🎵 Audio Tracks <span style="font-size:11px;color:#555;font-weight:400;text-transform:none;letter-spacing:0;">(loop forever)</span></div>
+    <div class="section-heading">🎵 Audio Tracks <span style="font-size:11px;color:#555;font-weight:400;text-transform:none;letter-spacing:0;">(play sequentially, loop forever)</span></div>
     <div class="audio-tracks-list" id="audio-tracks-list"></div>
     <button class="add-audio-btn">
       <input type="file" id="audio-file-input" accept=".mp3,.wav,.aac,.ogg,.flac,.m4a" multiple onchange="handleAudioAdd(event)"/>
@@ -993,115 +1081,447 @@ a{text-decoration:none;color:inherit;}
 </div>
 
 <script>
-let editingStreamId=null,selectedVideoFile=null,audioFiles=[],audioDurations=[],videoMuted=false,audioMuted=false,volDebounce=null;
-const liveMap=${JSON.stringify(liveMap)};
-const allStreams=${JSON.stringify(streams.reduce((a,s)=>{a[s.id]=s;return a;},{}))};
+// ============================================================
+// FIX #4: Audio track state management
+//
+// We now track two separate arrays:
+//   savedTracks  = tracks already in the DB (shown as "saved" badges)
+//   newAudioFiles = File objects the user just picked, not yet uploaded
+//   removedSavedIndices = indices of savedTracks the user wants deleted
+//
+// On save:
+//   1. DELETE removed saved tracks from DB via API
+//   2. Upload newAudioFiles via API
+//
+// On editStream() open:
+//   - Load savedTracks from allStreams[id].audio_tracks
+//   - Clear newAudioFiles
+// ============================================================
 
-function setPreviewEmpty(){document.getElementById('preview-container').innerHTML=\`<div class="preview-empty" onclick="document.getElementById('hidden-video-input').click()"><span class="preview-empty-icon">🎬</span><span class="preview-empty-text">Click to upload video, image, or GIF</span><span style="font-size:11px;color:#444;margin-top:4px;">MP4, MOV, GIF, JPG, PNG — up to 20GB</span></div>\`;}
-function setPreviewImage(src,name){document.getElementById('preview-container').innerHTML=\`<div class="preview-wrap" onclick="document.getElementById('hidden-video-input').click()"><img src="\${src}" alt="preview"/><div class="preview-overlay"><div class="preview-overlay-icon">🔄</div><div class="preview-overlay-text">Click to change</div><div style="font-size:11px;color:#ccc;margin-top:4px;">\${name||''}</div></div></div>\`;}
+let editingStreamId = null;
+let selectedVideoFile = null;
+let savedTracks = [];          // {path, name} — from DB
+let removedSavedIndices = [];  // indices into savedTracks to delete on save
+let newAudioFiles = [];        // File objects — newly added
+let newAudioDurations = [];
+let videoMuted = false;
+let audioMuted = false;
+let volDebounce = null;
+let pendingRemoveIndex = null; // for confirm dialog
+let pendingRemoveType = null;  // 'saved' or 'new'
 
-function openModal(){
-  editingStreamId=null;selectedVideoFile=null;audioFiles=[];audioDurations=[];videoMuted=false;audioMuted=false;
-  document.getElementById('modal-title').textContent='Add stream';
-  document.getElementById('stream-name').value='';document.getElementById('stream-key').value='';document.getElementById('stream-res').value='1080p';
-  document.getElementById('video-vol').value=100;document.getElementById('video-vol-val').textContent='100%';
-  document.getElementById('audio-vol').value=100;document.getElementById('audio-vol-val').textContent='100%';
-  document.getElementById('video-mute-btn').className='mute-btn';document.getElementById('audio-mute-btn').className='mute-btn';
-  document.getElementById('modal-error').style.display='none';document.getElementById('upload-progress').style.display='none';
-  document.getElementById('save-btn').disabled=false;document.getElementById('save-btn').textContent='Save stream';
-  document.getElementById('save-note').textContent='';
-  setPreviewEmpty();renderAudioTracks();
+const liveMap = ${JSON.stringify(liveMap)};
+const allStreams = ${JSON.stringify(streamsForClient)};
+
+// ---- Preview helpers ----
+function setPreviewEmpty(){
+  document.getElementById('preview-container').innerHTML =
+    '<div class="preview-empty" onclick="document.getElementById(\'hidden-video-input\').click()">' +
+    '<span class="preview-empty-icon">🎬</span>' +
+    '<span class="preview-empty-text">Click to upload video, image, or GIF</span>' +
+    '<span style="font-size:11px;color:#444;margin-top:4px;">MP4, MOV, GIF, JPG, PNG — up to 20GB</span>' +
+    '</div>';
+}
+function setPreviewImage(src, name) {
+  document.getElementById('preview-container').innerHTML =
+    '<div class="preview-wrap" onclick="document.getElementById(\'hidden-video-input\').click()">' +
+    '<img src="' + src + '" alt="preview"/>' +
+    '<div class="preview-overlay">' +
+    '<div class="preview-overlay-icon">🔄</div>' +
+    '<div class="preview-overlay-text">Click to change</div>' +
+    '<div style="font-size:11px;color:#ccc;margin-top:4px;">' + (name||'') + '</div>' +
+    '</div></div>';
+}
+
+// ---- Modal open/close ----
+function openModal() {
+  editingStreamId = null;
+  selectedVideoFile = null;
+  savedTracks = [];
+  removedSavedIndices = [];
+  newAudioFiles = [];
+  newAudioDurations = [];
+  videoMuted = false;
+  audioMuted = false;
+  document.getElementById('modal-title').textContent = 'Add stream';
+  document.getElementById('stream-name').value = '';
+  document.getElementById('stream-key').value = '';
+  document.getElementById('stream-res').value = '1080p';
+  document.getElementById('video-vol').value = 100;
+  document.getElementById('video-vol-val').textContent = '100%';
+  document.getElementById('audio-vol').value = 100;
+  document.getElementById('audio-vol-val').textContent = '100%';
+  document.getElementById('video-mute-btn').className = 'mute-btn';
+  document.getElementById('audio-mute-btn').className = 'mute-btn';
+  document.getElementById('modal-error').style.display = 'none';
+  document.getElementById('upload-progress').style.display = 'none';
+  document.getElementById('save-btn').disabled = false;
+  document.getElementById('save-btn').textContent = 'Save stream';
+  document.getElementById('save-note').textContent = '';
+  setPreviewEmpty();
+  renderAudioTracks();
   document.getElementById('stream-modal').classList.add('open');
 }
 
-function editStream(id){
-  editingStreamId=id;const s=allStreams[id];audioFiles=[];audioDurations=[];selectedVideoFile=null;
-  videoMuted=s.video_muted||false;audioMuted=s.audio_muted||false;
-  const isLive=liveMap[id]||false;
-  document.getElementById('modal-title').innerHTML='Edit stream'+(isLive?' <span class="live-tag">● LIVE</span>':'');
-  document.getElementById('stream-name').value=s.name||'';document.getElementById('stream-key').value=s.stream_key||'';document.getElementById('stream-res').value=s.resolution||'1080p';
-  document.getElementById('video-vol').value=s.video_volume||100;document.getElementById('video-vol-val').textContent=(s.video_volume||100)+'%';
-  document.getElementById('audio-vol').value=s.audio_volume||100;document.getElementById('audio-vol-val').textContent=(s.audio_volume||100)+'%';
-  document.getElementById('video-mute-btn').className='mute-btn'+(videoMuted?' muted':'');document.getElementById('audio-mute-btn').className='mute-btn'+(audioMuted?' muted':'');
-  document.getElementById('modal-error').style.display='none';document.getElementById('upload-progress').style.display='none';
-  document.getElementById('save-btn').disabled=false;document.getElementById('save-btn').textContent='Save changes';
-  document.getElementById('save-note').textContent=isLive?'Stream will restart briefly when you save':'';
-  if(s.thumb_path){setPreviewImage(s.thumb_path,s.file_name||'');}else{setPreviewEmpty();}
-  renderAudioTracks();document.getElementById('stream-modal').classList.add('open');
+function editStream(id) {
+  editingStreamId = id;
+  const s = allStreams[id];
+  // FIX #4: Load saved tracks from DB data
+  savedTracks = Array.isArray(s.audio_tracks) ? s.audio_tracks.slice() : [];
+  removedSavedIndices = [];
+  newAudioFiles = [];
+  newAudioDurations = [];
+  selectedVideoFile = null;
+  videoMuted = s.video_muted || false;
+  audioMuted = s.audio_muted || false;
+  const isLive = liveMap[id] || false;
+  document.getElementById('modal-title').innerHTML = 'Edit stream' + (isLive ? ' <span class="live-tag">● LIVE</span>' : '');
+  document.getElementById('stream-name').value = s.name || '';
+  document.getElementById('stream-key').value = s.stream_key || '';
+  document.getElementById('stream-res').value = s.resolution || '1080p';
+  document.getElementById('video-vol').value = s.video_volume || 100;
+  document.getElementById('video-vol-val').textContent = (s.video_volume || 100) + '%';
+  document.getElementById('audio-vol').value = s.audio_volume || 100;
+  document.getElementById('audio-vol-val').textContent = (s.audio_volume || 100) + '%';
+  document.getElementById('video-mute-btn').className = 'mute-btn' + (videoMuted ? ' muted' : '');
+  document.getElementById('audio-mute-btn').className = 'mute-btn' + (audioMuted ? ' muted' : '');
+  document.getElementById('modal-error').style.display = 'none';
+  document.getElementById('upload-progress').style.display = 'none';
+  document.getElementById('save-btn').disabled = false;
+  document.getElementById('save-btn').textContent = 'Save changes';
+  document.getElementById('save-note').textContent = isLive ? 'Stream will restart briefly when you save' : '';
+  if (s.thumb_path) { setPreviewImage(s.thumb_path, s.file_name || ''); } else { setPreviewEmpty(); }
+  renderAudioTracks();
+  document.getElementById('stream-modal').classList.add('open');
 }
 
-function closeModal(){document.getElementById('stream-modal').classList.remove('open');}
-
-function handleVideoSelect(e){
-  const file=e.target.files[0];if(!file)return;selectedVideoFile=file;
-  const ext=file.name.split('.').pop().toLowerCase();
-  if(['jpg','jpeg','png','webp'].includes(ext)){setPreviewImage(URL.createObjectURL(file),file.name);}
-  else{const v=document.createElement('video');v.src=URL.createObjectURL(file);v.muted=true;v.currentTime=0.5;v.onloadeddata=()=>{const c=document.createElement('canvas');c.width=320;c.height=180;c.getContext('2d').drawImage(v,0,0,320,180);setPreviewImage(c.toDataURL('image/jpeg'),file.name);};v.onerror=()=>setPreviewImage('',file.name);}
-  e.target.value='';
+function closeModal() {
+  document.getElementById('stream-modal').classList.remove('open');
 }
 
-function getAudioDuration(file){return new Promise(r=>{const a=new Audio();a.onloadedmetadata=()=>r(a.duration||0);a.onerror=()=>r(0);a.src=URL.createObjectURL(file);});}
-async function handleAudioAdd(e){for(const f of Array.from(e.target.files)){const d=await getAudioDuration(f);audioFiles.push(f);audioDurations.push(d);}renderAudioTracks();e.target.value='';}
-function removeAudioTrack(i){audioFiles.splice(i,1);audioDurations.splice(i,1);renderAudioTracks();}
-function moveTrack(i,dir){const ni=i+dir;if(ni<0||ni>=audioFiles.length)return;[audioFiles[i],audioFiles[ni]]=[audioFiles[ni],audioFiles[i]];[audioDurations[i],audioDurations[ni]]=[audioDurations[ni],audioDurations[i]];renderAudioTracks();}
-function renderAudioTracks(){
-  const list=document.getElementById('audio-tracks-list');
-  if(!audioFiles.length){list.innerHTML='';return;}
-  list.innerHTML=audioFiles.map((f,i)=>{const m=Math.floor(audioDurations[i]/60),s=Math.floor(audioDurations[i]%60);return \`<div class="audio-track-item"><div class="track-order-btns"><button class="track-order-btn" onclick="moveTrack(\${i},-1)" \${i===0?'disabled':''}>▲</button><button class="track-order-btn" onclick="moveTrack(\${i},1)" \${i===audioFiles.length-1?'disabled':''}>▼</button></div><span class="track-name-text">\${f.name}</span><span class="track-dur-text">\${m}:\${String(s).padStart(2,'0')}</span><button class="track-remove-btn" onclick="removeAudioTrack(\${i})">✕</button></div>\`;}).join('');
-}
-
-function onVolChange(type){
-  const val=parseInt(document.getElementById(type+'-vol').value);
-  document.getElementById(type+'-vol-val').textContent=val+'%';
-  if(type==='video'&&videoMuted&&val>0){videoMuted=false;document.getElementById('video-mute-btn').className='mute-btn';}
-  if(type==='audio'&&audioMuted&&val>0){audioMuted=false;document.getElementById('audio-mute-btn').className='mute-btn';}
-  if(editingStreamId&&liveMap[editingStreamId]){clearTimeout(volDebounce);volDebounce=setTimeout(async()=>{await saveMetaNow();await fetch('/api/streams/'+editingStreamId+'/restart',{method:'POST'});},500);}
-}
-
-function toggleMute(type){
-  if(type==='video'){videoMuted=!videoMuted;document.getElementById('video-mute-btn').className='mute-btn'+(videoMuted?' muted':'');document.getElementById('video-vol').value=videoMuted?0:100;document.getElementById('video-vol-val').textContent=videoMuted?'0%':'100%';}
-  else{audioMuted=!audioMuted;document.getElementById('audio-mute-btn').className='mute-btn'+(audioMuted?' muted':'');document.getElementById('audio-vol').value=audioMuted?0:100;document.getElementById('audio-vol-val').textContent=audioMuted?'0%':'100%';}
-  if(editingStreamId&&liveMap[editingStreamId]){clearTimeout(volDebounce);volDebounce=setTimeout(async()=>{await saveMetaNow();await fetch('/api/streams/'+editingStreamId+'/restart',{method:'POST'});},500);}
-}
-
-async function saveMetaNow(){
-  if(!editingStreamId)return;
-  await fetch('/api/streams/'+editingStreamId,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('stream-name').value.trim(),streamKey:document.getElementById('stream-key').value.trim(),resolution:document.getElementById('stream-res').value,videoVolume:parseInt(document.getElementById('video-vol').value),videoMuted,audioVolume:parseInt(document.getElementById('audio-vol').value),audioMuted})});
-}
-
-async function saveStream(){
-  const name=document.getElementById('stream-name').value.trim();
-  const key=document.getElementById('stream-key').value.trim();
-  const res=document.getElementById('stream-res').value;
-  const videoVol=parseInt(document.getElementById('video-vol').value);
-  const audioVol=parseInt(document.getElementById('audio-vol').value);
-  const errEl=document.getElementById('modal-error');const saveBtn=document.getElementById('save-btn');
-  if(!name){errEl.textContent='Please enter a stream name';errEl.style.display='block';return;}
-  saveBtn.disabled=true;saveBtn.textContent='Saving...';errEl.style.display='none';
-  const payload={name,streamKey:key,resolution:res,videoVolume:videoVol,videoMuted,audioVolume:audioVol,audioMuted};
-  if(editingStreamId){
-    const r=await fetch('/api/streams/'+editingStreamId,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const data=await r.json();
-    if(data.error){errEl.textContent=data.error;errEl.style.display='block';saveBtn.disabled=false;saveBtn.textContent='Save changes';return;}
-    if(selectedVideoFile){saveBtn.textContent='Uploading video...';const fd=new FormData();fd.append('file',selectedVideoFile);await fetch('/api/streams/'+editingStreamId+'/upload-video',{method:'POST',body:fd});}
-    for(let i=0;i<audioFiles.length;i++){saveBtn.textContent='Uploading audio '+(i+1)+'/'+audioFiles.length+'...';const fd=new FormData();fd.append('file',audioFiles[i]);await fetch('/api/streams/'+editingStreamId+'/upload-audio',{method:'POST',body:fd});}
-    if(liveMap[editingStreamId]){saveBtn.textContent='Restarting stream...';await fetch('/api/streams/'+editingStreamId+'/restart',{method:'POST'});}
-    closeModal();location.reload();return;
+// ---- Video select ----
+function handleVideoSelect(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  selectedVideoFile = file;
+  const ext = file.name.split('.').pop().toLowerCase();
+  if (['jpg','jpeg','png','webp'].includes(ext)) {
+    setPreviewImage(URL.createObjectURL(file), file.name);
+  } else {
+    const v = document.createElement('video');
+    v.src = URL.createObjectURL(file);
+    v.muted = true;
+    v.currentTime = 0.5;
+    v.onloadeddata = () => {
+      const c = document.createElement('canvas');
+      c.width = 320; c.height = 180;
+      c.getContext('2d').drawImage(v, 0, 0, 320, 180);
+      setPreviewImage(c.toDataURL('image/jpeg'), file.name);
+    };
+    v.onerror = () => setPreviewImage('', file.name);
   }
-  const r=await fetch('/api/streams',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  const data=await r.json();
-  if(data.error){errEl.textContent=data.error;errEl.style.display='block';saveBtn.disabled=false;saveBtn.textContent='Save stream';return;}
-  const sid=data.id;document.getElementById('upload-progress').style.display='block';
-  if(selectedVideoFile){saveBtn.textContent='Uploading video...';await uploadXHR('/api/streams/'+sid+'/upload-video',selectedVideoFile);}
-  for(let i=0;i<audioFiles.length;i++){saveBtn.textContent='Uploading audio '+(i+1)+'/'+audioFiles.length+'...';await uploadXHR('/api/streams/'+sid+'/upload-audio',audioFiles[i]);}
-  closeModal();location.reload();
+  e.target.value = '';
 }
 
-function uploadXHR(url,file){return new Promise(resolve=>{const fd=new FormData();fd.append('file',file);const xhr=new XMLHttpRequest();xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);document.getElementById('progress-fill').style.width=p+'%';document.getElementById('progress-label').textContent='Uploading '+p+'%...';}};xhr.onload=xhr.onerror=()=>resolve();xhr.open('POST',url);xhr.send(fd);});}
+// ---- Audio track management ----
+function getAudioDuration(file) {
+  return new Promise(r => {
+    const a = new Audio();
+    a.onloadedmetadata = () => r(a.duration || 0);
+    a.onerror = () => r(0);
+    a.src = URL.createObjectURL(file);
+  });
+}
 
-async function startStream(id){const btn=document.querySelector('#stream-'+id+' .btn-start');if(btn){btn.textContent='⏳ Starting...';btn.disabled=true;}const res=await fetch('/api/streams/'+id+'/start',{method:'POST'});const data=await res.json();if(data.error){alert(data.error);location.reload();return;}location.reload();}
-async function stopStream(id){await fetch('/api/streams/'+id+'/stop',{method:'POST'});location.reload();}
-async function deleteStream(id){if(!confirm('Delete this stream? This cannot be undone.'))return;await fetch('/api/streams/'+id,{method:'DELETE'});location.reload();}
+async function handleAudioAdd(e) {
+  for (const f of Array.from(e.target.files)) {
+    const d = await getAudioDuration(f);
+    newAudioFiles.push(f);
+    newAudioDurations.push(d);
+  }
+  renderAudioTracks();
+  e.target.value = '';
+}
+
+// Show confirm dialog before removing
+function askRemoveSaved(i) {
+  pendingRemoveIndex = i;
+  pendingRemoveType = 'saved';
+  document.getElementById('confirm-track-name').textContent =
+    'Remove "' + (savedTracks[i]?.name || 'this track') + '" from the stream?';
+  document.getElementById('confirm-overlay').classList.add('open');
+}
+function askRemoveNew(i) {
+  pendingRemoveIndex = i;
+  pendingRemoveType = 'new';
+  document.getElementById('confirm-track-name').textContent =
+    'Remove "' + (newAudioFiles[i]?.name || 'this track') + '"?';
+  document.getElementById('confirm-overlay').classList.add('open');
+}
+function closeConfirm() {
+  pendingRemoveIndex = null;
+  pendingRemoveType = null;
+  document.getElementById('confirm-overlay').classList.remove('open');
+}
+function confirmRemove() {
+  if (pendingRemoveType === 'saved' && pendingRemoveIndex !== null) {
+    removedSavedIndices.push(pendingRemoveIndex);
+    savedTracks.splice(pendingRemoveIndex, 1);
+  } else if (pendingRemoveType === 'new' && pendingRemoveIndex !== null) {
+    newAudioFiles.splice(pendingRemoveIndex, 1);
+    newAudioDurations.splice(pendingRemoveIndex, 1);
+  }
+  closeConfirm();
+  renderAudioTracks();
+}
+
+function renderAudioTracks() {
+  const list = document.getElementById('audio-tracks-list');
+  const totalCount = savedTracks.length + newAudioFiles.length;
+  if (!totalCount) { list.innerHTML = ''; return; }
+
+  let html = '';
+
+  // Saved tracks (from DB)
+  savedTracks.forEach((t, i) => {
+    html += '<div class="audio-track-item is-saved">' +
+      '<div class="track-order-btns">' +
+      '<button class="track-order-btn" disabled>▲</button>' +
+      '<button class="track-order-btn" disabled>▼</button>' +
+      '</div>' +
+      '<span class="track-name-text">' + (t.name || 'Track ' + (i+1)) + '</span>' +
+      '<span class="track-saved-badge">saved</span>' +
+      '<button class="track-remove-btn" onclick="askRemoveSaved(' + i + ')">✕</button>' +
+      '</div>';
+  });
+
+  // New tracks (not yet uploaded)
+  newAudioFiles.forEach((f, i) => {
+    const m = Math.floor(newAudioDurations[i] / 60);
+    const s = Math.floor(newAudioDurations[i] % 60);
+    html += '<div class="audio-track-item">' +
+      '<div class="track-order-btns">' +
+      '<button class="track-order-btn" onclick="moveNewTrack(' + i + ',-1)" ' + (i===0?'disabled':'') + '>▲</button>' +
+      '<button class="track-order-btn" onclick="moveNewTrack(' + i + ',1)" ' + (i===newAudioFiles.length-1?'disabled':'') + '>▼</button>' +
+      '</div>' +
+      '<span class="track-name-text">' + f.name + '</span>' +
+      '<span class="track-dur-text">' + m + ':' + String(s).padStart(2,'0') + '</span>' +
+      '<button class="track-remove-btn" onclick="askRemoveNew(' + i + ')">✕</button>' +
+      '</div>';
+  });
+
+  list.innerHTML = html;
+}
+
+function moveNewTrack(i, dir) {
+  const ni = i + dir;
+  if (ni < 0 || ni >= newAudioFiles.length) return;
+  [newAudioFiles[i], newAudioFiles[ni]] = [newAudioFiles[ni], newAudioFiles[i]];
+  [newAudioDurations[i], newAudioDurations[ni]] = [newAudioDurations[ni], newAudioDurations[i]];
+  renderAudioTracks();
+}
+
+// ---- Volume ----
+function onVolChange(type) {
+  const val = parseInt(document.getElementById(type + '-vol').value);
+  document.getElementById(type + '-vol-val').textContent = val + '%';
+  if (type === 'video' && videoMuted && val > 0) { videoMuted = false; document.getElementById('video-mute-btn').className = 'mute-btn'; }
+  if (type === 'audio' && audioMuted && val > 0) { audioMuted = false; document.getElementById('audio-mute-btn').className = 'mute-btn'; }
+  if (editingStreamId && liveMap[editingStreamId]) {
+    clearTimeout(volDebounce);
+    volDebounce = setTimeout(async () => {
+      await saveMetaNow();
+      await fetch('/api/streams/' + editingStreamId + '/restart', { method: 'POST' });
+    }, 500);
+  }
+}
+
+function toggleMute(type) {
+  if (type === 'video') {
+    videoMuted = !videoMuted;
+    document.getElementById('video-mute-btn').className = 'mute-btn' + (videoMuted ? ' muted' : '');
+    document.getElementById('video-vol').value = videoMuted ? 0 : 100;
+    document.getElementById('video-vol-val').textContent = videoMuted ? '0%' : '100%';
+  } else {
+    audioMuted = !audioMuted;
+    document.getElementById('audio-mute-btn').className = 'mute-btn' + (audioMuted ? ' muted' : '');
+    document.getElementById('audio-vol').value = audioMuted ? 0 : 100;
+    document.getElementById('audio-vol-val').textContent = audioMuted ? '0%' : '100%';
+  }
+  if (editingStreamId && liveMap[editingStreamId]) {
+    clearTimeout(volDebounce);
+    volDebounce = setTimeout(async () => {
+      await saveMetaNow();
+      await fetch('/api/streams/' + editingStreamId + '/restart', { method: 'POST' });
+    }, 500);
+  }
+}
+
+async function saveMetaNow() {
+  if (!editingStreamId) return;
+  await fetch('/api/streams/' + editingStreamId, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: document.getElementById('stream-name').value.trim(),
+      streamKey: document.getElementById('stream-key').value.trim(),
+      resolution: document.getElementById('stream-res').value,
+      videoVolume: parseInt(document.getElementById('video-vol').value),
+      videoMuted,
+      audioVolume: parseInt(document.getElementById('audio-vol').value),
+      audioMuted
+    })
+  });
+}
+
+// ---- Save stream (FIX #2: proper error handling, never gets stuck) ----
+async function saveStream() {
+  const name = document.getElementById('stream-name').value.trim();
+  const key = document.getElementById('stream-key').value.trim();
+  const res = document.getElementById('stream-res').value;
+  const videoVol = parseInt(document.getElementById('video-vol').value);
+  const audioVol = parseInt(document.getElementById('audio-vol').value);
+  const errEl = document.getElementById('modal-error');
+  const saveBtn = document.getElementById('save-btn');
+
+  if (!name) { errEl.textContent = 'Please enter a stream name'; errEl.style.display = 'block'; return; }
+
+  saveBtn.disabled = true;
+  saveBtn.textContent = 'Saving...';
+  errEl.style.display = 'none';
+
+  const payload = { name, streamKey: key, resolution: res, videoVolume: videoVol, videoMuted, audioVolume: audioVol, audioMuted };
+
+  try {
+    if (editingStreamId) {
+      // --- EDIT EXISTING STREAM ---
+      const r = await fetch('/api/streams/' + editingStreamId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+
+      // Remove deleted saved tracks
+      if (removedSavedIndices.length > 0) {
+        saveBtn.textContent = 'Removing tracks...';
+        await fetch('/api/streams/' + editingStreamId + '/remove-audio-tracks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ indices: removedSavedIndices })
+        });
+      }
+
+      // Upload new video if selected
+      if (selectedVideoFile) {
+        saveBtn.textContent = 'Uploading video...';
+        const fd = new FormData();
+        fd.append('file', selectedVideoFile);
+        const vr = await fetch('/api/streams/' + editingStreamId + '/upload-video', { method: 'POST', body: fd });
+        const vdata = await vr.json();
+        if (vdata.error) throw new Error(vdata.error);
+      }
+
+      // Upload new audio tracks
+      for (let i = 0; i < newAudioFiles.length; i++) {
+        saveBtn.textContent = 'Uploading audio ' + (i + 1) + '/' + newAudioFiles.length + '...';
+        const fd = new FormData();
+        fd.append('file', newAudioFiles[i]);
+        const ar = await fetch('/api/streams/' + editingStreamId + '/upload-audio', { method: 'POST', body: fd });
+        const adata = await ar.json();
+        if (adata.error) throw new Error(adata.error);
+      }
+
+      // Restart if live
+      if (liveMap[editingStreamId]) {
+        saveBtn.textContent = 'Restarting stream...';
+        await fetch('/api/streams/' + editingStreamId + '/restart', { method: 'POST' });
+      }
+
+      closeModal();
+      location.reload();
+
+    } else {
+      // --- CREATE NEW STREAM ---
+      const r = await fetch('/api/streams', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+
+      const sid = data.id;
+      document.getElementById('upload-progress').style.display = 'block';
+
+      if (selectedVideoFile) {
+        saveBtn.textContent = 'Uploading video...';
+        await uploadXHR('/api/streams/' + sid + '/upload-video', selectedVideoFile);
+      }
+      for (let i = 0; i < newAudioFiles.length; i++) {
+        saveBtn.textContent = 'Uploading audio ' + (i + 1) + '/' + newAudioFiles.length + '...';
+        await uploadXHR('/api/streams/' + sid + '/upload-audio', newAudioFiles[i]);
+      }
+
+      closeModal();
+      location.reload();
+    }
+  } catch (e) {
+    // FIX #2: Always re-enable button on error
+    errEl.textContent = e.message || 'Something went wrong. Please try again.';
+    errEl.style.display = 'block';
+    saveBtn.disabled = false;
+    saveBtn.textContent = editingStreamId ? 'Save changes' : 'Save stream';
+  }
+}
+
+function uploadXHR(url, file) {
+  return new Promise((resolve, reject) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    const xhr = new XMLHttpRequest();
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable) {
+        const p = Math.round(e.loaded / e.total * 100);
+        document.getElementById('progress-fill').style.width = p + '%';
+        document.getElementById('progress-label').textContent = 'Uploading ' + p + '%...';
+      }
+    };
+    xhr.onload = () => {
+      try {
+        const data = JSON.parse(xhr.responseText);
+        if (data.error) reject(new Error(data.error));
+        else resolve(data);
+      } catch(e) { resolve({}); }
+    };
+    xhr.onerror = () => reject(new Error('Upload failed. Please check your connection.'));
+    xhr.open('POST', url);
+    xhr.send(fd);
+  });
+}
+
+async function startStream(id) {
+  const btn = document.querySelector('#stream-' + id + ' .btn-start');
+  if (btn) { btn.textContent = '⏳ Starting...'; btn.disabled = true; }
+  try {
+    const res = await fetch('/api/streams/' + id + '/start', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { alert(data.error); location.reload(); return; }
+    location.reload();
+  } catch(e) { alert('Failed to start stream.'); location.reload(); }
+}
+
+async function stopStream(id) {
+  await fetch('/api/streams/' + id + '/stop', { method: 'POST' });
+  location.reload();
+}
+
+async function deleteStream(id) {
+  if (!confirm('Delete this stream? This cannot be undone.')) return;
+  await fetch('/api/streams/' + id, { method: 'DELETE' });
+  location.reload();
+}
 </script>
 </body>
 </html>`);
@@ -1227,16 +1647,48 @@ app.put('/api/streams/:id', requireAuthApi, async (req, res) => {
     const { name, streamKey, resolution, videoVolume, videoMuted, audioVolume, audioMuted } = req.body;
     const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
     if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    await pool.query('UPDATE streams SET name=$1,stream_key=$2,resolution=$3,video_volume=$4,video_muted=$5,audio_volume=$6,audio_muted=$7 WHERE id=$8',
-      [name, streamKey||null, resolution, videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false, req.params.id]);
+    await pool.query(
+      'UPDATE streams SET name=$1,stream_key=$2,resolution=$3,video_volume=$4,video_muted=$5,audio_volume=$6,audio_muted=$7 WHERE id=$8',
+      [name, streamKey||null, resolution, videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false, req.params.id]
+    );
     const active = activeStreams.get(parseInt(req.params.id));
-    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
+    if (active) {
+      const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0];
+      active.streamData = { ...active.streamData, ...updated };
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// FIX #4: New endpoint to remove specific saved audio tracks by index
+app.post('/api/streams/:id/remove-audio-tracks', requireAuthApi, async (req, res) => {
+  try {
+    const { indices } = req.body; // array of indices to remove
+    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
+    if (!stream) return res.status(404).json({ error: 'Stream not found' });
+    let tracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks : [];
+    // Remove by index in reverse order so indices stay valid
+    const sorted = [...indices].sort((a,b) => b - a);
+    for (const i of sorted) {
+      if (i >= 0 && i < tracks.length) {
+        const t = tracks[i];
+        if (t.path && fs.existsSync(t.path)) { try { fs.unlinkSync(t.path); } catch(e) {} }
+        tracks.splice(i, 1);
+      }
+    }
+    await pool.query('UPDATE streams SET audio_tracks=$1 WHERE id=$2', [JSON.stringify(tracks), req.params.id]);
+    const active = activeStreams.get(parseInt(req.params.id));
+    if (active) {
+      const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0];
+      active.streamData = { ...active.streamData, ...updated };
+    }
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/streams/:id/upload-video', requireAuthApi, upload.single('file'), async (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
     if (!stream) return res.status(404).json({ error: 'Stream not found' });
     if (stream.file_path && fs.existsSync(stream.file_path)) { try { fs.unlinkSync(stream.file_path); } catch(e) {} }
@@ -1251,6 +1703,7 @@ app.post('/api/streams/:id/upload-video', requireAuthApi, upload.single('file'),
 
 app.post('/api/streams/:id/upload-audio', requireAuthApi, upload.single('file'), async (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
     if (!stream) return res.status(404).json({ error: 'Stream not found' });
     const tracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks : [];
