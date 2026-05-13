@@ -187,8 +187,8 @@ function buildFFmpegArgs(stream) {
     const concatIns = tracks.map((_,i) => `[at${i}]`).join('');
     fc += `${concatIns}concat=n=${trackCount}:v=0:a=1[aconcat];`;
     fc += `[aconcat]aloop=loop=-1:size=2147483647[aloop];`;
-    fc += `[0:a]volume=${videoVol}[va];`;
-    fc += `[va][aloop]amix=inputs=2:duration=longest[aout]`;
+    fc += `[0:a]aloop=loop=-1:size=2147483647,volume=${videoVol}[va];`;
+    fc += `[va][aloop]amix=inputs=2:duration=longest:dropout_transition=0[aout]`;
     args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
   } else if (hasAudioTracks && !videoHasAudio) {
     let fc = '';
