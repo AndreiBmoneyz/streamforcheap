@@ -625,7 +625,6 @@ document.addEventListener('keydown',e=>{if(e.key==='Enter')login();});
 });
 
 // ==================== DEMO TIER (REMOVE BEFORE LAUNCH) ====================
-// Visit /demo-activate while logged in to instantly grant yourself Studio-level access for free.
 
 app.get('/demo-activate', requireAuth, async (req, res) => {
   try {
@@ -799,6 +798,15 @@ app.get('/dashboard', requireAuth, async (req, res) => {
     return a;
   },{});
 
+  // FIX: Safely escape JSON for injection into HTML to prevent script-breaking characters
+  function safeJson(obj) {
+    return JSON.stringify(obj)
+      .replace(/</g, '\\u003c')
+      .replace(/>/g, '\\u003e')
+      .replace(/&/g, '\\u0026')
+      .replace(/'/g, '\\u0027');
+  }
+
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -880,11 +888,10 @@ a{text-decoration:none;color:inherit;}
 .preview-wrap:hover .preview-overlay{opacity:1;}
 .preview-overlay-text{color:#fff;font-size:14px;font-weight:600;}
 .preview-overlay-icon{font-size:28px;margin-bottom:6px;}
-.preview-empty{width:100%;aspect-ratio:16/9;border-radius:10px;border:1.5px dashed #2a2a2a;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;transition:all 0.15s;margin-bottom:10px;}
+.preview-empty{width:100%;aspect-ratio:16/9;border-radius:10px;border:1.5px dashed #2a2a2a;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;transition:all 0.15s;margin-bottom:10px;background:transparent;}
 .preview-empty:hover{border-color:var(--accent);background:rgba(170,255,0,0.03);}
 .preview-empty-icon{font-size:32px;color:var(--accent);margin-bottom:8px;}
 .preview-empty-text{font-size:13px;color:#555;}
-.hidden-file{position:fixed;left:-9999px;opacity:0;width:0;height:0;}
 .volume-row{display:flex;align-items:center;gap:12px;margin-top:10px;}
 .volume-row label{font-size:12px;color:var(--muted);width:90px;flex-shrink:0;}
 .volume-row input[type=range]{flex:1;-webkit-appearance:none;height:4px;border-radius:99px;background:#2a2a2a;outline:none;cursor:pointer;}
@@ -905,9 +912,9 @@ a{text-decoration:none;color:inherit;}
 .track-dur-text{font-size:12px;color:#555;flex-shrink:0;}
 .track-remove-btn{background:none;border:none;color:#444;cursor:pointer;font-size:16px;padding:0 2px;transition:color 0.1s;}
 .track-remove-btn:hover{color:#f87171;}
-.add-audio-btn{width:100%;padding:10px;background:transparent;border:1.5px dashed #2a2a2a;border-radius:8px;color:#555;font-size:13px;cursor:pointer;position:relative;transition:all 0.15s;}
+.add-audio-row{position:relative;width:100%;}
+.add-audio-btn{width:100%;padding:10px;background:transparent;border:1.5px dashed #2a2a2a;border-radius:8px;color:#555;font-size:13px;cursor:pointer;transition:all 0.15s;}
 .add-audio-btn:hover{border-color:var(--accent);color:var(--accent);}
-.add-audio-btn input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;}
 .progress-wrap{margin-top:12px;display:none;}
 .progress-track{height:4px;background:#222;border-radius:99px;overflow:hidden;}
 .progress-fill{height:100%;background:var(--accent);border-radius:99px;width:0%;transition:width 0.3s;}
@@ -930,19 +937,14 @@ a{text-decoration:none;color:inherit;}
 </style>
 </head>
 <body>
-<div class="topbar">
-  <div class="topbar-left">
-    <a href="/" class="logo">stream<span class="g">forcheap</span></a>
-    <a href="/" class="home-link">← Home</a>
-  </div>
-  <div class="topbar-right">
-    <span class="user-name">👤 ${displayName}</span>
-    <span class="plan-badge ${user.plan === 'demo' ? 'demo' : ''}">${user.plan === 'demo' ? '🧪 DEMO' : user.plan}</span>
-    <a href="/logout" class="logout">Log out</a>
-  </div>
-</div>
 
-<input type="file" id="hidden-video-input" class="hidden-file" accept=".mp4,.mov,.avi,.mkv,.webm,.gif,.jpg,.jpeg,.png,.webp" onchange="handleVideoSelect(event)"/>
+<!-- FIX: Safe JSON data injection via script tags with type=application/json — never breaks the page -->
+<script type="application/json" id="__live_map__">${safeJson(liveMap)}</script>
+<script type="application/json" id="__all_streams__">${safeJson(streamsForClient)}</script>
+
+<!-- FIX: Hidden file input with display:none instead of position:fixed off-screen (fixes click failures in Chromium) -->
+<input type="file" id="hidden-video-input" style="display:none;" accept=".mp4,.mov,.avi,.mkv,.webm,.gif,.jpg,.jpeg,.png,.webp" />
+<input type="file" id="hidden-audio-input" style="display:none;" accept=".mp3,.wav,.aac,.ogg,.flac,.m4a" multiple />
 
 <div class="confirm-overlay" id="confirm-overlay">
   <div class="confirm-box">
@@ -983,10 +985,9 @@ a{text-decoration:none;color:inherit;}
     <hr class="section-divider"/>
     <div class="section-heading">🎵 Audio Tracks <span style="font-size:11px;color:#555;font-weight:400;text-transform:none;letter-spacing:0;">(play sequentially, loop forever)</span></div>
     <div class="audio-tracks-list" id="audio-tracks-list"></div>
-    <button class="add-audio-btn">
-      <input type="file" id="audio-file-input" accept=".mp3,.wav,.aac,.ogg,.flac,.m4a" multiple onchange="handleAudioAdd(event)"/>
-      + Add audio track
-    </button>
+    <div class="add-audio-row">
+      <button class="add-audio-btn" id="add-audio-btn">+ Add audio track</button>
+    </div>
     <div class="volume-row" style="margin-top:12px;">
       <label>Audio volume</label>
       <input type="range" id="audio-vol" min="0" max="100" value="100" oninput="onVolChange('audio')"/>
@@ -1000,6 +1001,18 @@ a{text-decoration:none;color:inherit;}
     <div class="error-box" id="modal-error"></div>
     <button class="modal-btn" id="save-btn" onclick="saveStream()">Save stream</button>
     <div class="save-note" id="save-note"></div>
+  </div>
+</div>
+
+<div class="topbar">
+  <div class="topbar-left">
+    <a href="/" class="logo">stream<span class="g">forcheap</span></a>
+    <a href="/" class="home-link">← Home</a>
+  </div>
+  <div class="topbar-right">
+    <span class="user-name">👤 ${displayName}</span>
+    <span class="plan-badge ${user.plan === 'demo' ? 'demo' : ''}">${user.plan === 'demo' ? '🧪 DEMO' : user.plan}</span>
+    <a href="/logout" class="logout">Log out</a>
   </div>
 </div>
 
@@ -1062,38 +1075,60 @@ a{text-decoration:none;color:inherit;}
 </div>
 
 <script>
-let editingStreamId = null;
-let selectedVideoFile = null;
-let savedTracks = [];
-let removedSavedIndices = [];
-let newAudioFiles = [];
-let newAudioDurations = [];
-let videoMuted = false;
-let audioMuted = false;
-let volDebounce = null;
-let pendingRemoveIndex = null;
-let pendingRemoveType = null;
+// FIX: Read data from safe JSON script tags instead of raw template literal injection
+var liveMap = JSON.parse(document.getElementById('__live_map__').textContent);
+var allStreams = JSON.parse(document.getElementById('__all_streams__').textContent);
 
-const liveMap = ${JSON.stringify(liveMap)};
-const allStreams = ${JSON.stringify(streamsForClient)};
+var editingStreamId = null;
+var selectedVideoFile = null;
+var savedTracks = [];
+var removedSavedIndices = [];
+var newAudioFiles = [];
+var newAudioDurations = [];
+var videoMuted = false;
+var audioMuted = false;
+var volDebounce = null;
+var pendingRemoveIndex = null;
+var pendingRemoveType = null;
 
-function setPreviewEmpty(){
-  document.getElementById('preview-container').innerHTML =
-    '<div class="preview-empty" onclick="document.getElementById(\'hidden-video-input\').click()">' +
-    '<span class="preview-empty-icon">🎬</span>' +
-    '<span class="preview-empty-text">Click to upload video, image, or GIF</span>' +
-    '<span style="font-size:11px;color:#444;margin-top:4px;">MP4, MOV, GIF, JPG, PNG — up to 20GB</span>' +
-    '</div>';
+// FIX: Wire up hidden file inputs via addEventListener instead of inline onchange on hidden elements
+document.getElementById('hidden-video-input').addEventListener('change', function(e) {
+  handleVideoSelect(e);
+});
+document.getElementById('hidden-audio-input').addEventListener('change', function(e) {
+  handleAudioAdd(e);
+});
+document.getElementById('add-audio-btn').addEventListener('click', function() {
+  document.getElementById('hidden-audio-input').click();
+});
+
+function setPreviewEmpty() {
+  var pc = document.getElementById('preview-container');
+  pc.innerHTML = '';
+  var div = document.createElement('div');
+  div.className = 'preview-empty';
+  div.innerHTML = '<span class="preview-empty-icon">🎬</span><span class="preview-empty-text">Click to upload video, image, or GIF</span><span style="font-size:11px;color:#444;margin-top:4px;">MP4, MOV, GIF, JPG, PNG — up to 20GB</span>';
+  div.addEventListener('click', function() {
+    document.getElementById('hidden-video-input').click();
+  });
+  pc.appendChild(div);
 }
+
 function setPreviewImage(src, name) {
-  document.getElementById('preview-container').innerHTML =
-    '<div class="preview-wrap" onclick="document.getElementById(\'hidden-video-input\').click()">' +
-    '<img src="' + src + '" alt="preview"/>' +
+  var pc = document.getElementById('preview-container');
+  pc.innerHTML = '';
+  var wrap = document.createElement('div');
+  wrap.className = 'preview-wrap';
+  wrap.innerHTML = (src ? '<img src="' + src + '" alt="preview"/>' : '') +
     '<div class="preview-overlay">' +
     '<div class="preview-overlay-icon">🔄</div>' +
     '<div class="preview-overlay-text">Click to change</div>' +
-    '<div style="font-size:11px;color:#ccc;margin-top:4px;">' + (name||'') + '</div>' +
-    '</div></div>';
+    '<div style="font-size:11px;color:#ccc;margin-top:4px;">' + (name || '') + '</div>' +
+    '</div>';
+  wrap.addEventListener('click', function() {
+    document.getElementById('hidden-video-input').click();
+  });
+  pc.appendChild(wrap);
 }
 
 function openModal() {
@@ -1127,7 +1162,8 @@ function openModal() {
 
 function editStream(id) {
   editingStreamId = id;
-  const s = allStreams[id];
+  var s = allStreams[id];
+  if (!s) { console.error('Stream not found:', id); return; }
   savedTracks = Array.isArray(s.audio_tracks) ? s.audio_tracks.slice() : [];
   removedSavedIndices = [];
   newAudioFiles = [];
@@ -1135,7 +1171,7 @@ function editStream(id) {
   selectedVideoFile = null;
   videoMuted = s.video_muted || false;
   audioMuted = s.audio_muted || false;
-  const isLive = liveMap[id] || false;
+  var isLive = liveMap[id] || false;
   document.getElementById('modal-title').innerHTML = 'Edit stream' + (isLive ? ' <span class="live-tag">● LIVE</span>' : '');
   document.getElementById('stream-name').value = s.name || '';
   document.getElementById('stream-key').value = s.stream_key || '';
@@ -1161,41 +1197,43 @@ function closeModal() {
 }
 
 function handleVideoSelect(e) {
-  const file = e.target.files[0];
+  var file = e.target.files[0];
   if (!file) return;
   selectedVideoFile = file;
-  const ext = file.name.split('.').pop().toLowerCase();
+  var ext = file.name.split('.').pop().toLowerCase();
   if (['jpg','jpeg','png','webp'].includes(ext)) {
     setPreviewImage(URL.createObjectURL(file), file.name);
   } else {
-    const v = document.createElement('video');
+    var v = document.createElement('video');
     v.src = URL.createObjectURL(file);
     v.muted = true;
     v.currentTime = 0.5;
-    v.onloadeddata = () => {
-      const c = document.createElement('canvas');
+    v.onloadeddata = function() {
+      var c = document.createElement('canvas');
       c.width = 320; c.height = 180;
       c.getContext('2d').drawImage(v, 0, 0, 320, 180);
       setPreviewImage(c.toDataURL('image/jpeg'), file.name);
     };
-    v.onerror = () => setPreviewImage('', file.name);
+    v.onerror = function() { setPreviewImage('', file.name); };
   }
+  // FIX: Reset input so same file can be re-selected
   e.target.value = '';
 }
 
 function getAudioDuration(file) {
-  return new Promise(r => {
-    const a = new Audio();
-    a.onloadedmetadata = () => r(a.duration || 0);
-    a.onerror = () => r(0);
+  return new Promise(function(resolve) {
+    var a = new Audio();
+    a.onloadedmetadata = function() { resolve(a.duration || 0); };
+    a.onerror = function() { resolve(0); };
     a.src = URL.createObjectURL(file);
   });
 }
 
 async function handleAudioAdd(e) {
-  for (const f of Array.from(e.target.files)) {
-    const d = await getAudioDuration(f);
-    newAudioFiles.push(f);
+  var files = Array.from(e.target.files);
+  for (var i = 0; i < files.length; i++) {
+    var d = await getAudioDuration(files[i]);
+    newAudioFiles.push(files[i]);
     newAudioDurations.push(d);
   }
   renderAudioTracks();
@@ -1206,21 +1244,24 @@ function askRemoveSaved(i) {
   pendingRemoveIndex = i;
   pendingRemoveType = 'saved';
   document.getElementById('confirm-track-name').textContent =
-    'Remove "' + (savedTracks[i]?.name || 'this track') + '" from the stream?';
+    'Remove "' + (savedTracks[i] && savedTracks[i].name ? savedTracks[i].name : 'this track') + '" from the stream?';
   document.getElementById('confirm-overlay').classList.add('open');
 }
+
 function askRemoveNew(i) {
   pendingRemoveIndex = i;
   pendingRemoveType = 'new';
   document.getElementById('confirm-track-name').textContent =
-    'Remove "' + (newAudioFiles[i]?.name || 'this track') + '"?';
+    'Remove "' + (newAudioFiles[i] ? newAudioFiles[i].name : 'this track') + '"?';
   document.getElementById('confirm-overlay').classList.add('open');
 }
+
 function closeConfirm() {
   pendingRemoveIndex = null;
   pendingRemoveType = null;
   document.getElementById('confirm-overlay').classList.remove('open');
 }
+
 function confirmRemove() {
   if (pendingRemoveType === 'saved' && pendingRemoveIndex !== null) {
     removedSavedIndices.push(pendingRemoveIndex);
@@ -1234,53 +1275,78 @@ function confirmRemove() {
 }
 
 function renderAudioTracks() {
-  const list = document.getElementById('audio-tracks-list');
-  const totalCount = savedTracks.length + newAudioFiles.length;
-  if (!totalCount) { list.innerHTML = ''; return; }
-  let html = '';
-  savedTracks.forEach((t, i) => {
-    html += '<div class="audio-track-item is-saved">' +
+  var list = document.getElementById('audio-tracks-list');
+  list.innerHTML = '';
+  savedTracks.forEach(function(t, i) {
+    var div = document.createElement('div');
+    div.className = 'audio-track-item is-saved';
+    div.innerHTML =
       '<div class="track-order-btns">' +
       '<button class="track-order-btn" disabled>▲</button>' +
       '<button class="track-order-btn" disabled>▼</button>' +
       '</div>' +
-      '<span class="track-name-text">' + (t.name || 'Track ' + (i+1)) + '</span>' +
-      '<span class="track-saved-badge">saved</span>' +
-      '<button class="track-remove-btn" onclick="askRemoveSaved(' + i + ')">✕</button>' +
-      '</div>';
+      '<span class="track-name-text">' + (t.name || 'Track ' + (i + 1)) + '</span>' +
+      '<span class="track-saved-badge">saved</span>';
+    var rmBtn = document.createElement('button');
+    rmBtn.className = 'track-remove-btn';
+    rmBtn.textContent = '✕';
+    rmBtn.addEventListener('click', (function(idx) { return function() { askRemoveSaved(idx); }; })(i));
+    div.appendChild(rmBtn);
+    list.appendChild(div);
   });
-  newAudioFiles.forEach((f, i) => {
-    const m = Math.floor(newAudioDurations[i] / 60);
-    const s = Math.floor(newAudioDurations[i] % 60);
-    html += '<div class="audio-track-item">' +
-      '<div class="track-order-btns">' +
-      '<button class="track-order-btn" onclick="moveNewTrack(' + i + ',-1)" ' + (i===0?'disabled':'') + '>▲</button>' +
-      '<button class="track-order-btn" onclick="moveNewTrack(' + i + ',1)" ' + (i===newAudioFiles.length-1?'disabled':'') + '>▼</button>' +
-      '</div>' +
-      '<span class="track-name-text">' + f.name + '</span>' +
-      '<span class="track-dur-text">' + m + ':' + String(s).padStart(2,'0') + '</span>' +
-      '<button class="track-remove-btn" onclick="askRemoveNew(' + i + ')">✕</button>' +
-      '</div>';
+  newAudioFiles.forEach(function(f, i) {
+    var m = Math.floor(newAudioDurations[i] / 60);
+    var s = Math.floor(newAudioDurations[i] % 60);
+    var div = document.createElement('div');
+    div.className = 'audio-track-item';
+    var upBtn = document.createElement('button');
+    upBtn.className = 'track-order-btn';
+    upBtn.textContent = '▲';
+    upBtn.disabled = i === 0;
+    upBtn.addEventListener('click', (function(idx) { return function() { moveNewTrack(idx, -1); }; })(i));
+    var downBtn = document.createElement('button');
+    downBtn.className = 'track-order-btn';
+    downBtn.textContent = '▼';
+    downBtn.disabled = i === newAudioFiles.length - 1;
+    downBtn.addEventListener('click', (function(idx) { return function() { moveNewTrack(idx, 1); }; })(i));
+    var orderDiv = document.createElement('div');
+    orderDiv.className = 'track-order-btns';
+    orderDiv.appendChild(upBtn);
+    orderDiv.appendChild(downBtn);
+    div.appendChild(orderDiv);
+    var nameSpan = document.createElement('span');
+    nameSpan.className = 'track-name-text';
+    nameSpan.textContent = f.name;
+    div.appendChild(nameSpan);
+    var durSpan = document.createElement('span');
+    durSpan.className = 'track-dur-text';
+    durSpan.textContent = m + ':' + String(s).padStart(2, '0');
+    div.appendChild(durSpan);
+    var rmBtn = document.createElement('button');
+    rmBtn.className = 'track-remove-btn';
+    rmBtn.textContent = '✕';
+    rmBtn.addEventListener('click', (function(idx) { return function() { askRemoveNew(idx); }; })(i));
+    div.appendChild(rmBtn);
+    list.appendChild(div);
   });
-  list.innerHTML = html;
 }
 
 function moveNewTrack(i, dir) {
-  const ni = i + dir;
+  var ni = i + dir;
   if (ni < 0 || ni >= newAudioFiles.length) return;
-  [newAudioFiles[i], newAudioFiles[ni]] = [newAudioFiles[ni], newAudioFiles[i]];
-  [newAudioDurations[i], newAudioDurations[ni]] = [newAudioDurations[ni], newAudioDurations[i]];
+  var tmpF = newAudioFiles[i]; newAudioFiles[i] = newAudioFiles[ni]; newAudioFiles[ni] = tmpF;
+  var tmpD = newAudioDurations[i]; newAudioDurations[i] = newAudioDurations[ni]; newAudioDurations[ni] = tmpD;
   renderAudioTracks();
 }
 
 function onVolChange(type) {
-  const val = parseInt(document.getElementById(type + '-vol').value);
+  var val = parseInt(document.getElementById(type + '-vol').value);
   document.getElementById(type + '-vol-val').textContent = val + '%';
   if (type === 'video' && videoMuted && val > 0) { videoMuted = false; document.getElementById('video-mute-btn').className = 'mute-btn'; }
   if (type === 'audio' && audioMuted && val > 0) { audioMuted = false; document.getElementById('audio-mute-btn').className = 'mute-btn'; }
   if (editingStreamId && liveMap[editingStreamId]) {
     clearTimeout(volDebounce);
-    volDebounce = setTimeout(async () => {
+    volDebounce = setTimeout(async function() {
       await saveMetaNow();
       await fetch('/api/streams/' + editingStreamId + '/restart', { method: 'POST' });
     }, 500);
@@ -1301,7 +1367,7 @@ function toggleMute(type) {
   }
   if (editingStreamId && liveMap[editingStreamId]) {
     clearTimeout(volDebounce);
-    volDebounce = setTimeout(async () => {
+    volDebounce = setTimeout(async function() {
       await saveMetaNow();
       await fetch('/api/streams/' + editingStreamId + '/restart', { method: 'POST' });
     }, 500);
@@ -1318,21 +1384,21 @@ async function saveMetaNow() {
       streamKey: document.getElementById('stream-key').value.trim(),
       resolution: document.getElementById('stream-res').value,
       videoVolume: parseInt(document.getElementById('video-vol').value),
-      videoMuted,
+      videoMuted: videoMuted,
       audioVolume: parseInt(document.getElementById('audio-vol').value),
-      audioMuted
+      audioMuted: audioMuted
     })
   });
 }
 
 async function saveStream() {
-  const name = document.getElementById('stream-name').value.trim();
-  const key = document.getElementById('stream-key').value.trim();
-  const res = document.getElementById('stream-res').value;
-  const videoVol = parseInt(document.getElementById('video-vol').value);
-  const audioVol = parseInt(document.getElementById('audio-vol').value);
-  const errEl = document.getElementById('modal-error');
-  const saveBtn = document.getElementById('save-btn');
+  var name = document.getElementById('stream-name').value.trim();
+  var key = document.getElementById('stream-key').value.trim();
+  var res = document.getElementById('stream-res').value;
+  var videoVol = parseInt(document.getElementById('video-vol').value);
+  var audioVol = parseInt(document.getElementById('audio-vol').value);
+  var errEl = document.getElementById('modal-error');
+  var saveBtn = document.getElementById('save-btn');
 
   if (!name) { errEl.textContent = 'Please enter a stream name'; errEl.style.display = 'block'; return; }
 
@@ -1340,16 +1406,16 @@ async function saveStream() {
   saveBtn.textContent = 'Saving...';
   errEl.style.display = 'none';
 
-  const payload = { name, streamKey: key, resolution: res, videoVolume: videoVol, videoMuted, audioVolume: audioVol, audioMuted };
+  var payload = { name: name, streamKey: key, resolution: res, videoVolume: videoVol, videoMuted: videoMuted, audioVolume: audioVol, audioMuted: audioMuted };
 
   try {
     if (editingStreamId) {
-      const r = await fetch('/api/streams/' + editingStreamId, {
+      var r = await fetch('/api/streams/' + editingStreamId, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      const data = await r.json();
+      var data = await r.json();
       if (data.error) throw new Error(data.error);
 
       if (removedSavedIndices.length > 0) {
@@ -1363,19 +1429,19 @@ async function saveStream() {
 
       if (selectedVideoFile) {
         saveBtn.textContent = 'Uploading video...';
-        const fd = new FormData();
+        var fd = new FormData();
         fd.append('file', selectedVideoFile);
-        const vr = await fetch('/api/streams/' + editingStreamId + '/upload-video', { method: 'POST', body: fd });
-        const vdata = await vr.json();
+        var vr = await fetch('/api/streams/' + editingStreamId + '/upload-video', { method: 'POST', body: fd });
+        var vdata = await vr.json();
         if (vdata.error) throw new Error(vdata.error);
       }
 
-      for (let i = 0; i < newAudioFiles.length; i++) {
+      for (var i = 0; i < newAudioFiles.length; i++) {
         saveBtn.textContent = 'Uploading audio ' + (i + 1) + '/' + newAudioFiles.length + '...';
-        const fd = new FormData();
-        fd.append('file', newAudioFiles[i]);
-        const ar = await fetch('/api/streams/' + editingStreamId + '/upload-audio', { method: 'POST', body: fd });
-        const adata = await ar.json();
+        var afd = new FormData();
+        afd.append('file', newAudioFiles[i]);
+        var ar = await fetch('/api/streams/' + editingStreamId + '/upload-audio', { method: 'POST', body: afd });
+        var adata = await ar.json();
         if (adata.error) throw new Error(adata.error);
       }
 
@@ -1388,24 +1454,24 @@ async function saveStream() {
       location.reload();
 
     } else {
-      const r = await fetch('/api/streams', {
+      var cr = await fetch('/api/streams', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      const data = await r.json();
-      if (data.error) throw new Error(data.error);
+      var cdata = await cr.json();
+      if (cdata.error) throw new Error(cdata.error);
 
-      const sid = data.id;
+      var sid = cdata.id;
       document.getElementById('upload-progress').style.display = 'block';
 
       if (selectedVideoFile) {
         saveBtn.textContent = 'Uploading video...';
         await uploadXHR('/api/streams/' + sid + '/upload-video', selectedVideoFile);
       }
-      for (let i = 0; i < newAudioFiles.length; i++) {
-        saveBtn.textContent = 'Uploading audio ' + (i + 1) + '/' + newAudioFiles.length + '...';
-        await uploadXHR('/api/streams/' + sid + '/upload-audio', newAudioFiles[i]);
+      for (var j = 0; j < newAudioFiles.length; j++) {
+        saveBtn.textContent = 'Uploading audio ' + (j + 1) + '/' + newAudioFiles.length + '...';
+        await uploadXHR('/api/streams/' + sid + '/upload-audio', newAudioFiles[j]);
       }
 
       closeModal();
@@ -1420,36 +1486,36 @@ async function saveStream() {
 }
 
 function uploadXHR(url, file) {
-  return new Promise((resolve, reject) => {
-    const fd = new FormData();
+  return new Promise(function(resolve, reject) {
+    var fd = new FormData();
     fd.append('file', file);
-    const xhr = new XMLHttpRequest();
-    xhr.upload.onprogress = e => {
+    var xhr = new XMLHttpRequest();
+    xhr.upload.onprogress = function(e) {
       if (e.lengthComputable) {
-        const p = Math.round(e.loaded / e.total * 100);
+        var p = Math.round(e.loaded / e.total * 100);
         document.getElementById('progress-fill').style.width = p + '%';
         document.getElementById('progress-label').textContent = 'Uploading ' + p + '%...';
       }
     };
-    xhr.onload = () => {
+    xhr.onload = function() {
       try {
-        const data = JSON.parse(xhr.responseText);
+        var data = JSON.parse(xhr.responseText);
         if (data.error) reject(new Error(data.error));
         else resolve(data);
       } catch(e) { resolve({}); }
     };
-    xhr.onerror = () => reject(new Error('Upload failed. Please check your connection.'));
+    xhr.onerror = function() { reject(new Error('Upload failed. Please check your connection.')); };
     xhr.open('POST', url);
     xhr.send(fd);
   });
 }
 
 async function startStream(id) {
-  const btn = document.querySelector('#stream-' + id + ' .btn-start');
+  var btn = document.querySelector('#stream-' + id + ' .btn-start');
   if (btn) { btn.textContent = '⏳ Starting...'; btn.disabled = true; }
   try {
-    const res = await fetch('/api/streams/' + id + '/start', { method: 'POST' });
-    const data = await res.json();
+    var res = await fetch('/api/streams/' + id + '/start', { method: 'POST' });
+    var data = await res.json();
     if (data.error) { alert(data.error); location.reload(); return; }
     location.reload();
   } catch(e) { alert('Failed to start stream.'); location.reload(); }
