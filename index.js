@@ -164,12 +164,14 @@ function buildFFmpegArgs(stream) {
   const args = [];
 
   // ── Video / Image input ──────────────────────────────────────────────────
- if (isImage) {
+  if (isImage) {
     args.push('-thread_queue_size', '512', '-re', '-loop', '1', '-framerate', '30', '-i', stream.file_path);
   } else if (isGif) {
     args.push('-thread_queue_size', '512', '-re', '-ignore_loop', '0', '-stream_loop', '-1', '-i', stream.file_path);
   } else {
-   
+    args.push('-thread_queue_size', '512', '-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
+  }
+
   // ── Audio track inputs ───────────────────────────────────────────────────
   for (const t of tracks) {
     args.push('-thread_queue_size', '512', '-stream_loop', '-1', '-i', t.path);
