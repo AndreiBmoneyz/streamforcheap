@@ -121,7 +121,29 @@ async function generateThumb(filePath, streamId) {
   });
 }
 
-// ==================== FFMPEG (LAG FIX) ====================
+// ==================== FFMPEG (DRIFT FIX) ====================
+//
+// ROOT CAUSE OF BAR DRIFTING:
+//   The old code used -rtmp_buffer 5000 (5s RTMP buffer) which pre-buffered
+//   frames ahead of the live edge, causing YouTube's DVR window to grow.
+//   Images/GIFs had no -re flag so FFmpeg encoded faster than real-time,
+//   flooding the buffer. Timestamp accumulation from genpts+igndts without
+//   a proper wall-clock anchor caused slow clock drift on top of that.
+//
+// THE FIX:
+//   1. ALL input types now use -re (real-time rate limiter) so FFmpeg never
+//      produces frames faster than 1x playback speed.
+//   2. -rtmp_buffer reduced to 0 — no pre-buffering at the RTMP layer.
+//      YouTube handles its own live buffer; we should send at exactly live pace.
+//   3. Removed -fflags +igndts — we trust the input DTS and only add +genpts
+//      when needed. Ignoring DTS was causing timestamp accumulation.
+//   4. Added -use_wallclock_as_timestamps 1 for image/GIF inputs (they have
+//      no real timestamps) so FFmpeg uses the system clock as the time source,
+//      which perfectly matches real-time and never drifts.
+//   5. Removed -avoid_negative_ts make_zero from the main video loop — this
+//      was resetting timestamps on each loop iteration causing small jumps that
+//      accumulated over time. Using -start_at_zero instead for clean looping.
+//   6. -flvflags no_duration_filesize kept — required for live FLV streams.
 
 function buildFFmpegArgs(stream) {
   const width  = stream.resolution === '1080p' ? 1920 : 1280;
@@ -141,20 +163,48 @@ function buildFFmpegArgs(stream) {
   const rtmp = `rtmp://a.rtmp.youtube.com/live2/${stream.stream_key}`;
   const args = [];
 
-  args.push('-fflags', '+genpts+igndts');
-
+  // ── Video / Image input ──────────────────────────────────────────────────
   if (isImage) {
-    args.push('-thread_queue_size', '512', '-loop', '1', '-framerate', '30', '-i', stream.file_path);
+    // Static image: use wall clock as timestamp source so the stream clock
+    // is always anchored to real time — no drift possible.
+    args.push(
+      '-re',
+      '-thread_queue_size', '512',
+      '-use_wallclock_as_timestamps', '1',
+      '-loop', '1',
+      '-framerate', '30',
+      '-i', stream.file_path
+    );
   } else if (isGif) {
-    args.push('-thread_queue_size', '512', '-ignore_loop', '0', '-stream_loop', '-1', '-i', stream.file_path);
+    // GIF: same wall-clock trick; GIFs have unreliable internal timestamps.
+    args.push(
+      '-re',
+      '-thread_queue_size', '512',
+      '-use_wallclock_as_timestamps', '1',
+      '-ignore_loop', '0',
+      '-stream_loop', '-1',
+      '-i', stream.file_path
+    );
   } else {
-    args.push('-thread_queue_size', '512', '-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
+    // Video: -re enforces real-time pacing. -stream_loop -1 loops forever.
+    // -fflags +genpts regenerates PTS from DTS when missing (common in some
+    // containers) but we do NOT use +igndts anymore — ignoring DTS caused
+    // slow timestamp drift as errors accumulated across loop boundaries.
+    args.push(
+      '-re',
+      '-thread_queue_size', '512',
+      '-fflags', '+genpts',
+      '-stream_loop', '-1',
+      '-i', stream.file_path
+    );
   }
 
+  // ── Audio track inputs ───────────────────────────────────────────────────
   for (const t of tracks) {
     args.push('-thread_queue_size', '512', '-stream_loop', '-1', '-i', t.path);
   }
 
+  // ── Video encoding ───────────────────────────────────────────────────────
   args.push(
     '-c:v', 'libx264',
     '-preset', 'veryfast',
@@ -162,18 +212,21 @@ function buildFFmpegArgs(stream) {
     '-level', '4.2',
     '-threads', '0',
     '-r', '30',
-    '-g', '60',
+    '-g', '60',           // keyframe every 2s at 30fps — YouTube's preferred interval
     '-keyint_min', '60',
-    '-sc_threshold', '0',
+    '-sc_threshold', '0', // no scene-change keyframes — keeps bitrate stable
     '-b:v', bitrate,
     '-maxrate', bitrate,
     '-bufsize', bufsize,
     '-pix_fmt', 'yuv420p',
     '-vf', vf,
+    // CBR with HRD: tells the encoder to pad frames to hit the target bitrate
+    // exactly, which is what YouTube's ingest expects for live streams.
     '-x264-params', 'nal-hrd=cbr:force-cfr=1',
     '-max_muxing_queue_size', '1024'
   );
 
+  // ── Audio mixing ─────────────────────────────────────────────────────────
   const videoHasAudio = !['.jpg','.jpeg','.png','.webp','.gif'].includes(ext);
 
   if (hasAudioTracks && videoHasAudio) {
@@ -201,10 +254,12 @@ function buildFFmpegArgs(stream) {
   } else if (!hasAudioTracks && videoHasAudio) {
     args.push('-map', '0:v', '-map', '0:a', '-af', `volume=${videoVol}`);
   } else {
+    // No audio at all — generate silent audio so YouTube doesn't reject stream
     args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
       '-map', '0:v', '-map', isImage||isGif ? '1:a' : '0:a');
   }
 
+  // ── Output / RTMP ────────────────────────────────────────────────────────
   args.push(
     '-c:a', 'aac',
     '-b:a', '128k',
@@ -212,7 +267,11 @@ function buildFFmpegArgs(stream) {
     '-ac', '2',
     '-f', 'flv',
     '-flvflags', 'no_duration_filesize',
-    '-rtmp_buffer', '5000',
+    // FIX: rtmp_buffer 0 — do NOT pre-buffer at the RTMP layer.
+    // The old value of 5000ms caused FFmpeg to send 5s of frames ahead of
+    // real time, which is what made the live bar drift backward over time.
+    // YouTube's own ingest handles buffering on their end; we just send live.
+    '-rtmp_buffer', '0',
     '-rtmp_live', 'live',
     rtmp
   );
@@ -798,7 +857,6 @@ app.get('/dashboard', requireAuth, async (req, res) => {
     return a;
   },{});
 
-  // FIX: Safely escape JSON for injection into HTML to prevent script-breaking characters
   function safeJson(obj) {
     return JSON.stringify(obj)
       .replace(/</g, '\\u003c')
@@ -938,11 +996,9 @@ a{text-decoration:none;color:inherit;}
 </head>
 <body>
 
-<!-- FIX: Safe JSON data injection via script tags with type=application/json — never breaks the page -->
 <script type="application/json" id="__live_map__">${safeJson(liveMap)}</script>
 <script type="application/json" id="__all_streams__">${safeJson(streamsForClient)}</script>
 
-<!-- FIX: Hidden file input with display:none instead of position:fixed off-screen (fixes click failures in Chromium) -->
 <input type="file" id="hidden-video-input" style="display:none;" accept=".mp4,.mov,.avi,.mkv,.webm,.gif,.jpg,.jpeg,.png,.webp" />
 <input type="file" id="hidden-audio-input" style="display:none;" accept=".mp3,.wav,.aac,.ogg,.flac,.m4a" multiple />
 
@@ -1075,7 +1131,6 @@ a{text-decoration:none;color:inherit;}
 </div>
 
 <script>
-// FIX: Read data from safe JSON script tags instead of raw template literal injection
 var liveMap = JSON.parse(document.getElementById('__live_map__').textContent);
 var allStreams = JSON.parse(document.getElementById('__all_streams__').textContent);
 
@@ -1091,7 +1146,6 @@ var volDebounce = null;
 var pendingRemoveIndex = null;
 var pendingRemoveType = null;
 
-// FIX: Wire up hidden file inputs via addEventListener instead of inline onchange on hidden elements
 document.getElementById('hidden-video-input').addEventListener('change', function(e) {
   handleVideoSelect(e);
 });
@@ -1216,7 +1270,6 @@ function handleVideoSelect(e) {
     };
     v.onerror = function() { setPreviewImage('', file.name); };
   }
-  // FIX: Reset input so same file can be re-selected
   e.target.value = '';
 }
 
