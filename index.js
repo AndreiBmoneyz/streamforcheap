@@ -170,7 +170,7 @@ function buildFFmpegArgs(stream) {
     '-maxrate', bitrate,
     '-bufsize', bufsize,
     '-pix_fmt', 'yuv420p',
-    '-vf', vf,
+    '-vf', `loop=-1:size=32767,${vf}`,
     '-x264-params', 'nal-hrd=cbr:force-cfr=1',
     '-max_muxing_queue_size', '1024'
   );
