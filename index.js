@@ -255,25 +255,34 @@ function buildFFmpegArgs(stream) {
 function startFFmpeg(streamId, streamData) {
   if (!streamData.file_path || !fs.existsSync(streamData.file_path)) return;
   if (!streamData.stream_key) return;
+
+  function spawnNew() {
+    const args = buildFFmpegArgs(streamData);
+    const proc = spawn('ffmpeg', args);
+    const entry = { proc, restarting: false, streamData: { ...streamData } };
+    activeStreams.set(streamId, entry);
+    proc.stderr.on('data', () => {});
+    proc.on('close', () => {
+      const current = activeStreams.get(streamId);
+      if (current && !current.restarting) {
+        setTimeout(() => {
+          const cur = activeStreams.get(streamId);
+          if (cur && !cur.restarting) startFFmpeg(streamId, cur.streamData);
+        }, 3000);
+      }
+    });
+  }
+
   const existing = activeStreams.get(streamId);
   if (existing) {
     existing.restarting = true;
+    existing.proc.once('close', () => {
+      setTimeout(spawnNew, 1500);
+    });
     try { existing.proc.kill('SIGKILL'); } catch(e) {}
+  } else {
+    spawnNew();
   }
-  const args = buildFFmpegArgs(streamData);
-  const proc = spawn('ffmpeg', args);
-  const entry = { proc, restarting: false, streamData: { ...streamData } };
-  activeStreams.set(streamId, entry);
-  proc.stderr.on('data', () => {});
-  proc.on('close', () => {
-    const current = activeStreams.get(streamId);
-    if (current && !current.restarting) {
-      setTimeout(() => {
-        const cur = activeStreams.get(streamId);
-        if (cur && !cur.restarting) startFFmpeg(streamId, cur.streamData);
-      }, 3000);
-    }
-  });
 }
 
 // ==================== SHARED NAV HELPERS ====================
