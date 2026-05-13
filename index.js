@@ -176,7 +176,7 @@ function buildFFmpegArgs(stream) {
   );
 
   // ── Audio mixing ─────────────────────────────────────────────────────────
-  const videoHasAudio = !['.jpg','.jpeg','.png','.webp','.gif'].includes(ext);
+  const videoHasAudio = !['.jpg','.jpeg','.png','.webp','.gif'].includes(ext) && !stream.video_muted;
 
   if (hasAudioTracks && videoHasAudio) {
     let fc = '';
