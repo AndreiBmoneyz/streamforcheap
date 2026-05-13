@@ -19,7 +19,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'fallback_secret',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 7 * 24 * 60 * 60 * 1000 }
+  cookie: { secure: true, maxAge: 7 * 24 * 60 * 60 * 1000 }
 }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
