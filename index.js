@@ -90,6 +90,7 @@ const PLANS = {
   pro:     { name: 'Pro',     price: 5,  slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '' },
   creator: { name: 'Creator', price: 12, slots: 3, priceId: process.env.STRIPE_PRICE_CREATOR || '' },
   studio:  { name: 'Studio',  price: 20, slots: 6, priceId: process.env.STRIPE_PRICE_STUDIO || '' },
+  demo:    { name: 'Demo',    price: 0,  slots: 6, priceId: '' }, // REMOVE BEFORE LAUNCH
 };
 
 function requireAuth(req, res, next) {
@@ -121,15 +122,6 @@ async function generateThumb(filePath, streamId) {
 }
 
 // ==================== FFMPEG (LAG FIX) ====================
-// KEY CHANGES FOR LAG:
-// - Added -thread_queue_size 512 on all inputs to prevent input starvation
-// - Added rtmp_buffer 5000ms (5 second RTMP output buffer) — YouTube buffers this before showing to viewers
-// - Added -max_muxing_queue_size 1024 to prevent muxer stalls
-// - Added -probesize 10M and -analyzeduration 10M for better input analysis
-// - Use concat filter instead of amix for sequential audio track playback (fixes 3-sec loop bug)
-// - Removed zerolatency tune (counterproductive for streaming — increases decoder complexity)
-// - Added -preset veryfast with proper CBR settings
-// - Added -flags +global_header for stable stream headers
 
 function buildFFmpegArgs(stream) {
   const width  = stream.resolution === '1080p' ? 1920 : 1280;
@@ -149,7 +141,6 @@ function buildFFmpegArgs(stream) {
   const rtmp = `rtmp://a.rtmp.youtube.com/live2/${stream.stream_key}`;
   const args = [];
 
-  // Fix pts/timing issues
   args.push('-fflags', '+genpts+igndts');
 
   if (isImage) {
@@ -160,12 +151,10 @@ function buildFFmpegArgs(stream) {
     args.push('-thread_queue_size', '512', '-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
   }
 
-  // Add audio track inputs
   for (const t of tracks) {
     args.push('-thread_queue_size', '512', '-stream_loop', '-1', '-i', t.path);
   }
 
-  // Video encoding
   args.push(
     '-c:v', 'libx264',
     '-preset', 'veryfast',
@@ -187,16 +176,8 @@ function buildFFmpegArgs(stream) {
 
   const videoHasAudio = !['.jpg','.jpeg','.png','.webp','.gif'].includes(ext);
 
-  // AUDIO MIXING:
-  // Use concat filter for SEQUENTIAL playback of tracks (fixes the 3-sec loop bug).
-  // amix plays all tracks simultaneously which causes the truncation issue.
-  // concat plays them one after another, then loops back.
-
   if (hasAudioTracks && videoHasAudio) {
-    // Mix video audio + sequential audio tracks
-    // Step 1: concat all audio tracks sequentially with loop
     let fc = '';
-    // Build concat for audio tracks
     const trackCount = tracks.length;
     for (let i = 0; i < trackCount; i++) {
       fc += `[${i+1}:a]volume=${audioVol}[at${i}];`;
@@ -208,7 +189,6 @@ function buildFFmpegArgs(stream) {
     fc += `[va][aloop]amix=inputs=2:duration=longest[aout]`;
     args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
   } else if (hasAudioTracks && !videoHasAudio) {
-    // Sequential audio tracks only (image/gif source)
     let fc = '';
     const trackCount = tracks.length;
     for (let i = 0; i < trackCount; i++) {
@@ -221,7 +201,6 @@ function buildFFmpegArgs(stream) {
   } else if (!hasAudioTracks && videoHasAudio) {
     args.push('-map', '0:v', '-map', '0:a', '-af', `volume=${videoVol}`);
   } else {
-    // No audio at all — generate silence
     args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
       '-map', '0:v', '-map', isImage||isGif ? '1:a' : '0:a');
   }
@@ -233,9 +212,6 @@ function buildFFmpegArgs(stream) {
     '-ac', '2',
     '-f', 'flv',
     '-flvflags', 'no_duration_filesize',
-    // 5-second RTMP buffer — this is the key lag fix.
-    // ffmpeg fills this buffer BEFORE pushing to YouTube, so YouTube
-    // always has data ahead and never stalls the viewer stream.
     '-rtmp_buffer', '5000',
     '-rtmp_live', 'live',
     rtmp
@@ -270,7 +246,6 @@ function startFFmpeg(streamId, streamData) {
 
 // ==================== SHARED NAV HELPERS ====================
 
-// Inline nav CSS used across pages
 const NAV_CSS = `
 nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,10,10,0.97);backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,0.08);padding:0 2rem;height:64px;display:flex;align-items:center;justify-content:space-between;}
 .nav-logo{font-size:20px;font-weight:800;letter-spacing:-0.5px;text-decoration:none;color:#fff;}
@@ -381,7 +356,6 @@ footer{border-top:1px solid var(--border);padding:3rem 2rem;text-align:center;}
     <a href="#pricing">PRICING</a>
     <a href="#faq">FAQ</a>
   </div>
-  <!-- FIX #2 + #3: nav-auth starts with login/register, replaced via JS if logged in -->
   <div class="nav-auth" id="nav-auth">
     <a href="/login" class="nav-login">Log in</a>
     <a href="/register" class="nav-btn">Get started</a>
@@ -484,7 +458,6 @@ footer{border-top:1px solid var(--border);padding:3rem 2rem;text-align:center;}
   <div class="footer-copy">© 2026 StreamForCheap. The cheapest 24/7 streaming service on the internet.</div>
 </footer>
 <script>
-// FIX #2 + #3: Check login state, update nav with username + My Streams button
 fetch('/api/me').then(r=>r.json()).then(data=>{
   if(data.userId){
     const name = data.username || data.email || 'Account';
@@ -512,7 +485,6 @@ function choosePlan(plan) {
 
 // ==================== AUTH ====================
 
-// FIX #2: Return email too so landing page can show it as fallback
 app.get('/api/me', (req, res) => {
   if (!req.session.userId) return res.json({ userId: null });
   pool.query('SELECT id, username, email FROM users WHERE id=$1', [req.session.userId])
@@ -652,6 +624,21 @@ document.addEventListener('keydown',e=>{if(e.key==='Enter')login();});
 </html>`);
 });
 
+// ==================== DEMO TIER (REMOVE BEFORE LAUNCH) ====================
+// Visit /demo-activate while logged in to instantly grant yourself Studio-level access for free.
+
+app.get('/demo-activate', requireAuth, async (req, res) => {
+  try {
+    await pool.query(
+      'UPDATE users SET plan=$1, stream_slots=$2, subscription_status=$3 WHERE id=$4',
+      ['demo', 6, 'active', req.session.userId]
+    );
+    res.redirect('/dashboard?welcome=1');
+  } catch (e) {
+    res.status(500).send('Demo activation failed: ' + e.message);
+  }
+});
+
 // ==================== CHECKOUT ====================
 
 app.get('/checkout', requireAuth, async (req, res) => {
@@ -670,7 +657,6 @@ app.get('/checkout', requireAuth, async (req, res) => {
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;padding:2rem 2rem 4rem;}
-/* FIX #1: Prominent back button at top */
 .back-bar{max-width:860px;margin:0 auto 1.5rem;}
 .back-arrow{display:inline-flex;align-items:center;gap:8px;color:#aaa;font-size:14px;font-weight:600;text-decoration:none;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 18px;transition:all 0.15s;}
 .back-arrow:hover{color:#aaff00;border-color:rgba(170,255,0,0.3);background:#161616;}
@@ -705,7 +691,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </style>
 </head>
 <body>
-<!-- FIX #1: Big visible back button -->
 <div class="back-bar">
   <a href="/#pricing" class="back-arrow">
     <span class="arrow">←</span> Back to pricing
@@ -798,7 +783,7 @@ async function handlePayment(){
 app.get('/dashboard', requireAuth, async (req, res) => {
   const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
   const streams = (await pool.query('SELECT * FROM streams WHERE user_id=$1 ORDER BY created_at DESC', [req.session.userId])).rows;
-  const planSlots = { starter:1, pro:1, creator:3, studio:6 };
+  const planSlots = { starter:1, pro:1, creator:3, studio:6, demo:6 };
   const maxSlots = planSlots[user.plan] || 0;
   const liveMap = {};
   streams.forEach(s => { liveMap[s.id] = activeStreams.has(s.id); });
@@ -806,7 +791,6 @@ app.get('/dashboard', requireAuth, async (req, res) => {
   const hasActivePlan = user.subscription_status === 'active' || user.plan !== 'free';
   const displayName = user.username || user.email.split('@')[0];
 
-  // Serialize streams with audio_tracks as proper JSON for the client
   const streamsForClient = streams.reduce((a,s)=>{
     a[s.id] = {
       ...s,
@@ -828,16 +812,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 a{text-decoration:none;color:inherit;}
 .topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 2rem;height:64px;display:flex;align-items:center;justify-content:space-between;position:fixed;top:0;left:0;right:0;z-index:100;}
 .logo{font-size:18px;font-weight:800;text-decoration:none;color:#fff;}.logo .g{color:var(--accent);}
-/* FIX #3: back to home link in topbar */
 .topbar-left{display:flex;align-items:center;gap:16px;}
 .home-link{font-size:13px;color:#555;display:flex;align-items:center;gap:4px;transition:color 0.15s;text-decoration:none;}
 .home-link:hover{color:#aaa;}
 .topbar-right{display:flex;align-items:center;gap:12px;}
 .plan-badge{background:rgba(170,255,0,0.1);border:1px solid rgba(170,255,0,0.2);color:var(--accent);font-size:12px;font-weight:700;padding:4px 12px;border-radius:99px;text-transform:uppercase;}
+.plan-badge.demo{background:rgba(255,170,0,0.1);border-color:rgba(255,170,0,0.3);color:#ffaa00;}
 .user-name{font-size:14px;color:#ccc;font-weight:600;}
 .logout{font-size:13px;color:var(--muted);text-decoration:none;}.logout:hover{color:#f87171;}
 .main{max-width:900px;margin:0 auto;padding:84px 1rem 4rem;}
 .welcome-banner{background:rgba(170,255,0,0.08);border:1px solid rgba(170,255,0,0.2);border-radius:12px;padding:1rem 1.5rem;margin-bottom:1.5rem;font-size:15px;color:var(--accent);display:${welcome?'block':'none'};}
+.demo-banner{background:rgba(255,170,0,0.08);border:1px solid rgba(255,170,0,0.25);border-radius:12px;padding:0.75rem 1.25rem;margin-bottom:1.5rem;font-size:13px;color:#ffaa00;display:${user.plan==='demo'?'flex':'none'};align-items:center;gap:8px;}
 .page-title{font-size:26px;font-weight:800;margin-bottom:4px;letter-spacing:-0.5px;}
 .page-sub{font-size:14px;color:var(--muted);margin-bottom:2rem;}
 .upgrade-banner{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:2rem;text-align:center;margin-bottom:1.5rem;}
@@ -876,7 +861,6 @@ a{text-decoration:none;color:inherit;}
 .empty-icon{font-size:48px;margin-bottom:1rem;}
 .empty-state h3{font-size:18px;font-weight:700;margin-bottom:8px;}
 .empty-state p{font-size:14px;color:var(--muted);margin-bottom:1.5rem;}
-/* Modal */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:200;display:none;align-items:flex-start;justify-content:center;padding:2rem 1rem;overflow-y:auto;}
 .modal-overlay.open{display:flex;}
 .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:2rem;max-width:540px;width:100%;margin:auto;}
@@ -909,7 +893,6 @@ a{text-decoration:none;color:inherit;}
 .mute-btn{padding:5px 12px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;border:1px solid #333;background:transparent;color:#666;transition:all 0.15s;flex-shrink:0;}
 .mute-btn.muted{background:rgba(248,113,113,0.1);border-color:rgba(248,113,113,0.3);color:#f87171;}
 .mute-btn:hover{border-color:var(--accent);color:var(--accent);}
-/* FIX #4: Audio tracks list — shows DB tracks + new uploads */
 .audio-tracks-list{display:flex;flex-direction:column;gap:8px;margin-bottom:10px;}
 .audio-track-item{display:flex;align-items:center;gap:8px;background:var(--surface2);border:1px solid #222;border-radius:8px;padding:8px 12px;}
 .audio-track-item.is-saved{border-color:rgba(170,255,0,0.15);}
@@ -934,7 +917,6 @@ a{text-decoration:none;color:inherit;}
 .modal-btn:hover{opacity:0.85;}.modal-btn:disabled{opacity:0.4;cursor:not-allowed;}
 .save-note{font-size:12px;color:#555;text-align:center;margin-top:8px;}
 .live-tag{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--accent);background:rgba(170,255,0,0.1);border:1px solid rgba(170,255,0,0.2);border-radius:99px;padding:2px 8px;margin-left:8px;vertical-align:middle;}
-/* Confirm dialog */
 .confirm-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:300;display:none;align-items:center;justify-content:center;padding:1rem;}
 .confirm-overlay.open{display:flex;}
 .confirm-box{background:#111;border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:1.5rem;max-width:360px;width:100%;text-align:center;}
@@ -949,21 +931,19 @@ a{text-decoration:none;color:inherit;}
 </head>
 <body>
 <div class="topbar">
-  <!-- FIX #3: Home link in topbar -->
   <div class="topbar-left">
     <a href="/" class="logo">stream<span class="g">forcheap</span></a>
     <a href="/" class="home-link">← Home</a>
   </div>
   <div class="topbar-right">
     <span class="user-name">👤 ${displayName}</span>
-    <span class="plan-badge">${user.plan}</span>
+    <span class="plan-badge ${user.plan === 'demo' ? 'demo' : ''}">${user.plan === 'demo' ? '🧪 DEMO' : user.plan}</span>
     <a href="/logout" class="logout">Log out</a>
   </div>
 </div>
 
 <input type="file" id="hidden-video-input" class="hidden-file" accept=".mp4,.mov,.avi,.mkv,.webm,.gif,.jpg,.jpeg,.png,.webp" onchange="handleVideoSelect(event)"/>
 
-<!-- Confirm delete audio track dialog -->
 <div class="confirm-overlay" id="confirm-overlay">
   <div class="confirm-box">
     <h3>Remove this track?</h3>
@@ -1025,6 +1005,7 @@ a{text-decoration:none;color:inherit;}
 
 <div class="main">
   ${welcome?`<div class="welcome-banner">🎉 Welcome, ${displayName}! Your subscription is active. Add your first stream below to get started.</div>`:''}
+  <div class="demo-banner">🧪 Demo mode active — Studio tier unlocked for free. Remove before launch.</div>
   <div class="page-title">Your Streams</div>
   <div class="page-sub">${user.email} · ${user.plan} plan</div>
 
@@ -1081,39 +1062,21 @@ a{text-decoration:none;color:inherit;}
 </div>
 
 <script>
-// ============================================================
-// FIX #4: Audio track state management
-//
-// We now track two separate arrays:
-//   savedTracks  = tracks already in the DB (shown as "saved" badges)
-//   newAudioFiles = File objects the user just picked, not yet uploaded
-//   removedSavedIndices = indices of savedTracks the user wants deleted
-//
-// On save:
-//   1. DELETE removed saved tracks from DB via API
-//   2. Upload newAudioFiles via API
-//
-// On editStream() open:
-//   - Load savedTracks from allStreams[id].audio_tracks
-//   - Clear newAudioFiles
-// ============================================================
-
 let editingStreamId = null;
 let selectedVideoFile = null;
-let savedTracks = [];          // {path, name} — from DB
-let removedSavedIndices = [];  // indices into savedTracks to delete on save
-let newAudioFiles = [];        // File objects — newly added
+let savedTracks = [];
+let removedSavedIndices = [];
+let newAudioFiles = [];
 let newAudioDurations = [];
 let videoMuted = false;
 let audioMuted = false;
 let volDebounce = null;
-let pendingRemoveIndex = null; // for confirm dialog
-let pendingRemoveType = null;  // 'saved' or 'new'
+let pendingRemoveIndex = null;
+let pendingRemoveType = null;
 
 const liveMap = ${JSON.stringify(liveMap)};
 const allStreams = ${JSON.stringify(streamsForClient)};
 
-// ---- Preview helpers ----
 function setPreviewEmpty(){
   document.getElementById('preview-container').innerHTML =
     '<div class="preview-empty" onclick="document.getElementById(\'hidden-video-input\').click()">' +
@@ -1133,7 +1096,6 @@ function setPreviewImage(src, name) {
     '</div></div>';
 }
 
-// ---- Modal open/close ----
 function openModal() {
   editingStreamId = null;
   selectedVideoFile = null;
@@ -1166,7 +1128,6 @@ function openModal() {
 function editStream(id) {
   editingStreamId = id;
   const s = allStreams[id];
-  // FIX #4: Load saved tracks from DB data
   savedTracks = Array.isArray(s.audio_tracks) ? s.audio_tracks.slice() : [];
   removedSavedIndices = [];
   newAudioFiles = [];
@@ -1199,7 +1160,6 @@ function closeModal() {
   document.getElementById('stream-modal').classList.remove('open');
 }
 
-// ---- Video select ----
 function handleVideoSelect(e) {
   const file = e.target.files[0];
   if (!file) return;
@@ -1223,7 +1183,6 @@ function handleVideoSelect(e) {
   e.target.value = '';
 }
 
-// ---- Audio track management ----
 function getAudioDuration(file) {
   return new Promise(r => {
     const a = new Audio();
@@ -1243,7 +1202,6 @@ async function handleAudioAdd(e) {
   e.target.value = '';
 }
 
-// Show confirm dialog before removing
 function askRemoveSaved(i) {
   pendingRemoveIndex = i;
   pendingRemoveType = 'saved';
@@ -1279,10 +1237,7 @@ function renderAudioTracks() {
   const list = document.getElementById('audio-tracks-list');
   const totalCount = savedTracks.length + newAudioFiles.length;
   if (!totalCount) { list.innerHTML = ''; return; }
-
   let html = '';
-
-  // Saved tracks (from DB)
   savedTracks.forEach((t, i) => {
     html += '<div class="audio-track-item is-saved">' +
       '<div class="track-order-btns">' +
@@ -1294,8 +1249,6 @@ function renderAudioTracks() {
       '<button class="track-remove-btn" onclick="askRemoveSaved(' + i + ')">✕</button>' +
       '</div>';
   });
-
-  // New tracks (not yet uploaded)
   newAudioFiles.forEach((f, i) => {
     const m = Math.floor(newAudioDurations[i] / 60);
     const s = Math.floor(newAudioDurations[i] % 60);
@@ -1309,7 +1262,6 @@ function renderAudioTracks() {
       '<button class="track-remove-btn" onclick="askRemoveNew(' + i + ')">✕</button>' +
       '</div>';
   });
-
   list.innerHTML = html;
 }
 
@@ -1321,7 +1273,6 @@ function moveNewTrack(i, dir) {
   renderAudioTracks();
 }
 
-// ---- Volume ----
 function onVolChange(type) {
   const val = parseInt(document.getElementById(type + '-vol').value);
   document.getElementById(type + '-vol-val').textContent = val + '%';
@@ -1374,7 +1325,6 @@ async function saveMetaNow() {
   });
 }
 
-// ---- Save stream (FIX #2: proper error handling, never gets stuck) ----
 async function saveStream() {
   const name = document.getElementById('stream-name').value.trim();
   const key = document.getElementById('stream-key').value.trim();
@@ -1394,7 +1344,6 @@ async function saveStream() {
 
   try {
     if (editingStreamId) {
-      // --- EDIT EXISTING STREAM ---
       const r = await fetch('/api/streams/' + editingStreamId, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -1403,7 +1352,6 @@ async function saveStream() {
       const data = await r.json();
       if (data.error) throw new Error(data.error);
 
-      // Remove deleted saved tracks
       if (removedSavedIndices.length > 0) {
         saveBtn.textContent = 'Removing tracks...';
         await fetch('/api/streams/' + editingStreamId + '/remove-audio-tracks', {
@@ -1413,7 +1361,6 @@ async function saveStream() {
         });
       }
 
-      // Upload new video if selected
       if (selectedVideoFile) {
         saveBtn.textContent = 'Uploading video...';
         const fd = new FormData();
@@ -1423,7 +1370,6 @@ async function saveStream() {
         if (vdata.error) throw new Error(vdata.error);
       }
 
-      // Upload new audio tracks
       for (let i = 0; i < newAudioFiles.length; i++) {
         saveBtn.textContent = 'Uploading audio ' + (i + 1) + '/' + newAudioFiles.length + '...';
         const fd = new FormData();
@@ -1433,7 +1379,6 @@ async function saveStream() {
         if (adata.error) throw new Error(adata.error);
       }
 
-      // Restart if live
       if (liveMap[editingStreamId]) {
         saveBtn.textContent = 'Restarting stream...';
         await fetch('/api/streams/' + editingStreamId + '/restart', { method: 'POST' });
@@ -1443,7 +1388,6 @@ async function saveStream() {
       location.reload();
 
     } else {
-      // --- CREATE NEW STREAM ---
       const r = await fetch('/api/streams', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1468,7 +1412,6 @@ async function saveStream() {
       location.reload();
     }
   } catch (e) {
-    // FIX #2: Always re-enable button on error
     errEl.textContent = e.message || 'Something went wrong. Please try again.';
     errEl.style.display = 'block';
     saveBtn.disabled = false;
@@ -1609,7 +1552,7 @@ app.post('/webhook', async (req, res) => {
       const subscription = await stripe.subscriptions.retrieve(subscriptionId);
       const priceId = subscription.items.data[0]?.price?.id;
       const plan = Object.entries(PLANS).find(([,p]) => p.priceId === priceId)?.[0] || 'pro';
-      const planSlots = { starter:1, pro:1, creator:3, studio:6 };
+      const planSlots = { starter:1, pro:1, creator:3, studio:6, demo:6 };
       await pool.query(
         'UPDATE users SET plan=$1, stream_slots=$2, subscription_status=$3 WHERE stripe_subscription_id=$4',
         [plan, planSlots[plan]||1, 'active', subscriptionId]
@@ -1660,14 +1603,12 @@ app.put('/api/streams/:id', requireAuthApi, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// FIX #4: New endpoint to remove specific saved audio tracks by index
 app.post('/api/streams/:id/remove-audio-tracks', requireAuthApi, async (req, res) => {
   try {
-    const { indices } = req.body; // array of indices to remove
+    const { indices } = req.body;
     const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
     if (!stream) return res.status(404).json({ error: 'Stream not found' });
     let tracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks : [];
-    // Remove by index in reverse order so indices stay valid
     const sorted = [...indices].sort((a,b) => b - a);
     for (const i of sorted) {
       if (i >= 0 && i < tracks.length) {
