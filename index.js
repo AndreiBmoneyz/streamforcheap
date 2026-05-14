@@ -9,6 +9,7 @@ const path = require('path');
 const Stripe = require('stripe');
 
 const app = express();
+app.set('trust proxy', 1);
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use('/webhook', express.raw({ type: 'application/json' }));
