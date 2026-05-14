@@ -263,23 +263,30 @@ function buildFFmpegArgs(stream) {
   const rtmp = `rtmp://a.rtmp.youtube.com/live2/${stream.stream_key}`;
   const args = [];
 
-  // Video input — pre-encoded, just copy bytes
+  // Video input
   args.push('-thread_queue_size', '4096', '-re', '-stream_loop', '-1', '-i', stream.encoded_path);
 
-// Audio — use premixed file if available, otherwise silence
+  // Audio input — use premixed file if available, otherwise silence
   const hasPremix = stream.premix_path && fs.existsSync(stream.premix_path);
- args.push('-map', '0:v', '-map', '1:a');
-
-
-  // Video: copy, no re-encoding
-  args.push('-c:v', 'copy');
-
   if (hasPremix) {
-  args.push('-map', '0:v', '-map', '1:a');
-
+    args.push('-thread_queue_size', '4096', '-stream_loop', '-1', '-i', stream.premix_path);
   } else {
-    args.push('-map', '0:v', '-map', '1:a');
+    args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo');
   }
+
+  args.push('-map', '0:v', '-map', '1:a');
+  args.push('-c:v', 'copy');
+  args.push(
+    '-c:a', 'copy',
+    '-f', 'flv',
+    '-flvflags', 'no_duration_filesize',
+    '-rtmp_buffer', '0',
+    '-rtmp_live', 'live',
+    rtmp
+  );
+
+  return args;
+}
 
   args.push(
   '-c:a', 'copy',
