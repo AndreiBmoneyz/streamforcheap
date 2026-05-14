@@ -267,7 +267,7 @@ function buildFFmpegArgs(stream) {
     }
     const concatIns = tracks.map((_,i) => `[at${i}]`).join('');
     fc += `${concatIns}concat=n=${trackCount}:v=0:a=1[aconcat];`;
-    fc += `[aconcat]aloop=loop=-1:size=2147483647[aout]`;
+    fc += `[aconcat]aloop=loop=-1:size=0[aout]`;
     args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
   } else {
     args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-map', '0:v', '-map', '1:a');
