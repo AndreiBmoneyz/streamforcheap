@@ -27,8 +27,10 @@ const activeStreams = new Map();
 
 const UPLOAD_DIR = '/app/uploads';
 const THUMB_DIR = '/app/thumbs';
+const ENCODED_DIR = '/app/encoded';
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(THUMB_DIR)) fs.mkdirSync(THUMB_DIR, { recursive: true });
+if (!fs.existsSync(ENCODED_DIR)) fs.mkdirSync(ENCODED_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
@@ -79,6 +81,9 @@ pool.query(`
 
 pool.query(`
   ALTER TABLE streams ADD COLUMN IF NOT EXISTS thumb_path TEXT;
+  ALTER TABLE streams ADD COLUMN IF NOT EXISTS encoded_path TEXT;
+  ALTER TABLE streams ADD COLUMN IF NOT EXISTS encode_status TEXT NOT NULL DEFAULT 'none';
+  ALTER TABLE streams ADD COLUMN IF NOT EXISTS encode_progress INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'inactive';
@@ -121,6 +126,94 @@ async function generateThumb(filePath, streamId) {
   });
 }
 
+async function preEncodeFile(streamId, filePath, resolution) {
+  const ext = path.extname(filePath).toLowerCase();
+  const isImage = ['.jpg','.jpeg','.png','.webp'].includes(ext);
+  const isGif = ext === '.gif';
+  const width = resolution === '1080p' ? 1920 : 1280;
+  const height = resolution === '1080p' ? 1080 : 720;
+  const bitrate = resolution === '1080p' ? '2500k' : '1500k';
+  const bufsize = resolution === '1080p' ? '5000k' : '3000k';
+  const vf = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p`;
+  const encodedFile = path.join(ENCODED_DIR, 'encoded_' + streamId + '_' + Date.now() + '.mp4');
+
+  await pool.query('UPDATE streams SET encode_status=$1, encode_progress=$2 WHERE id=$3', ['encoding', 0, streamId]);
+
+  return new Promise((resolve, reject) => {
+    let args = [];
+
+    if (isImage) {
+      args = [
+        '-loop', '1', '-framerate', '30', '-i', filePath,
+        '-t', '10',
+        '-c:v', 'libx264', '-preset', 'superfast',
+        '-profile:v', 'high', '-level', '4.2',
+        '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
+        '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', bufsize,
+        '-pix_fmt', 'yuv420p', '-vf', vf,
+        '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+        '-an', '-y', encodedFile
+      ];
+    } else if (isGif) {
+      args = [
+        '-ignore_loop', '0', '-i', filePath,
+        '-t', '30',
+        '-c:v', 'libx264', '-preset', 'superfast',
+        '-profile:v', 'high', '-level', '4.2',
+        '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
+        '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', bufsize,
+        '-pix_fmt', 'yuv420p', '-vf', vf,
+        '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+        '-an', '-y', encodedFile
+      ];
+    } else {
+      args = [
+        '-i', filePath,
+        '-c:v', 'libx264', '-preset', 'superfast',
+        '-profile:v', 'high', '-level', '4.2',
+        '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
+        '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', bufsize,
+        '-pix_fmt', 'yuv420p', '-vf', vf,
+        '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+        '-an', '-y', encodedFile
+      ];
+    }
+
+    let duration = 0;
+    const probe = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', filePath]);
+    let probeOut = '';
+    probe.stdout.on('data', d => probeOut += d.toString());
+    probe.on('close', () => {
+      try {
+        const info = JSON.parse(probeOut);
+        duration = parseFloat(info.format?.duration || 0);
+      } catch(e) {}
+
+      const proc = spawn('ffmpeg', args);
+      proc.stderr.on('data', (data) => {
+        const msg = data.toString();
+        const timeMatch = msg.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
+        if (timeMatch && duration > 0) {
+          const secs = parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseFloat(timeMatch[3]);
+          const progress = Math.min(99, Math.round((secs / duration) * 100));
+          pool.query('UPDATE streams SET encode_progress=$1 WHERE id=$2', [progress, streamId]).catch(() => {});
+        }
+      });
+      proc.on('close', async (code) => {
+        if (code === 0 && fs.existsSync(encodedFile)) {
+          await pool.query('UPDATE streams SET encoded_path=$1, encode_status=$2, encode_progress=$3 WHERE id=$4',
+            [encodedFile, 'ready', 100, streamId]);
+          resolve(encodedFile);
+        } else {
+          await pool.query('UPDATE streams SET encode_status=$1, encode_progress=$2 WHERE id=$3',
+            ['failed', 0, streamId]);
+          reject(new Error('Pre-encoding failed'));
+        }
+      });
+    });
+  });
+}
+
 // ==================== FFMPEG (DRIFT FIX) ====================
 //
 // ROOT CAUSE OF BAR DRIFTING:
@@ -146,75 +239,27 @@ async function generateThumb(filePath, streamId) {
 //   6. -flvflags no_duration_filesize kept — required for live FLV streams.
 
 function buildFFmpegArgs(stream) {
-  const width  = stream.resolution === '1080p' ? 1920 : 1280;
-  const height = stream.resolution === '1080p' ? 1080 : 720;
-  const bitrate = stream.resolution === '1080p' ? '4000k' : '2500k';
-  const bufsize = stream.resolution === '1080p' ? '8000k' : '5000k';
-  const ext = path.extname(stream.file_path || '').toLowerCase();
-  const isImage = ['.jpg','.jpeg','.png','.webp'].includes(ext);
-  const isGif   = ext === '.gif';
-  const tracks  = Array.isArray(stream.audio_tracks)
+  const tracks = Array.isArray(stream.audio_tracks)
     ? stream.audio_tracks.filter(t => t.path && fs.existsSync(t.path))
     : [];
   const hasAudioTracks = tracks.length > 0;
-  const videoVol = stream.video_muted ? 0 : (stream.video_volume || 100) / 100;
   const audioVol = stream.audio_muted ? 0 : (stream.audio_volume || 100) / 100;
-  const vf = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p`;
   const rtmp = `rtmp://a.rtmp.youtube.com/live2/${stream.stream_key}`;
   const args = [];
 
-  // ── Video / Image input ──────────────────────────────────────────────────
-  if (isImage) {
-    args.push('-thread_queue_size', '512', '-loop', '1', '-framerate', '30', '-i', stream.file_path);
-  } else if (isGif) {
-    args.push('-thread_queue_size', '512', '-ignore_loop', '0', '-stream_loop', '-1', '-i', stream.file_path);
-  } else {
-    args.push('-thread_queue_size', '512', '-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
-  }
+  // Video input — pre-encoded, just copy bytes
+  args.push('-thread_queue_size', '4096', '-re', '-stream_loop', '-1', '-i', stream.encoded_path);
 
-  // ── Audio track inputs ───────────────────────────────────────────────────
+  // Audio track inputs
   for (const t of tracks) {
-    args.push('-thread_queue_size', '512', '-stream_loop', '-1', '-i', t.path);
+    args.push('-thread_queue_size', '4096', '-stream_loop', '-1', '-i', t.path);
   }
 
-  // ── Video encoding ───────────────────────────────────────────────────────
-  args.push(
-    '-c:v', 'libx264',
-    '-preset', 'veryfast',
-    '-profile:v', 'high',
-    '-level', '4.2',
-    '-threads', '0',
-    '-r', '30',
-    '-g', '60',           // keyframe every 2s at 30fps — YouTube's preferred interval
-    '-keyint_min', '60',
-    '-sc_threshold', '0', // no scene-change keyframes — keeps bitrate stable
-    '-b:v', bitrate,
-    '-maxrate', bitrate,
-    '-bufsize', bufsize,
-    '-pix_fmt', 'yuv420p',
-    '-vf', vf,
-    // CBR with HRD: tells the encoder to pad frames to hit the target bitrate
-    // exactly, which is what YouTube's ingest expects for live streams.
-    '-x264-params', 'nal-hrd=cbr:force-cfr=1',
-    '-max_muxing_queue_size', '1024'
-  );
+  // Video: copy, no re-encoding
+  args.push('-c:v', 'copy');
 
-  // ── Audio mixing ─────────────────────────────────────────────────────────
-  const videoHasAudio = !['.jpg','.jpeg','.png','.webp','.gif'].includes(ext);
-
-  if (hasAudioTracks && videoHasAudio) {
-    let fc = '';
-    const trackCount = tracks.length;
-    for (let i = 0; i < trackCount; i++) {
-      fc += `[${i+1}:a]volume=${audioVol}[at${i}];`;
-    }
-    const concatIns = tracks.map((_,i) => `[at${i}]`).join('');
-    fc += `${concatIns}concat=n=${trackCount}:v=0:a=1[aconcat];`;
-    fc += `[aconcat]aloop=loop=-1:size=2147483647[aloop];`;
-    fc += `[0:a]volume=${videoVol}[va];`;
-    fc += `[va][aloop]amix=inputs=2:duration=longest[aout]`;
-    args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
-  } else if (hasAudioTracks && !videoHasAudio) {
+  // Audio mixing
+  if (hasAudioTracks) {
     let fc = '';
     const trackCount = tracks.length;
     for (let i = 0; i < trackCount; i++) {
@@ -224,15 +269,10 @@ function buildFFmpegArgs(stream) {
     fc += `${concatIns}concat=n=${trackCount}:v=0:a=1[aconcat];`;
     fc += `[aconcat]aloop=loop=-1:size=2147483647[aout]`;
     args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
-  } else if (!hasAudioTracks && videoHasAudio) {
-    args.push('-map', '0:v', '-map', '0:a', '-af', `volume=${videoVol}`);
   } else {
-    // No audio at all — generate silent audio so YouTube doesn't reject stream
-    args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-      '-map', '0:v', '-map', isImage||isGif ? '1:a' : '0:a');
+    args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-map', '0:v', '-map', '1:a');
   }
 
-  // ── Output / RTMP ────────────────────────────────────────────────────────
   args.push(
     '-c:a', 'aac',
     '-b:a', '128k',
@@ -240,10 +280,6 @@ function buildFFmpegArgs(stream) {
     '-ac', '2',
     '-f', 'flv',
     '-flvflags', 'no_duration_filesize',
-    // FIX: rtmp_buffer 0 — do NOT pre-buffer at the RTMP layer.
-    // The old value of 5000ms caused FFmpeg to send 5s of frames ahead of
-    // real time, which is what made the live bar drift backward over time.
-    // YouTube's own ingest handles buffering on their end; we just send live.
     '-rtmp_buffer', '0',
     '-rtmp_live', 'live',
     rtmp
@@ -253,27 +289,53 @@ function buildFFmpegArgs(stream) {
 }
 
 function startFFmpeg(streamId, streamData) {
-  if (!streamData.file_path || !fs.existsSync(streamData.file_path)) return;
+  if (!streamData.encoded_path || !fs.existsSync(streamData.encoded_path)) return;
   if (!streamData.stream_key) return;
+
+  function spawnNew() {
+    const args = buildFFmpegArgs(streamData);
+    const proc = spawn('ffmpeg', args);
+    const entry = { proc, restarting: false, streamData: { ...streamData } };
+    activeStreams.set(streamId, entry);
+    proc.stderr.on('data', (data) => {
+      const msg = data.toString();
+      if (
+        msg.includes('Connection refused') ||
+        msg.includes('broken pipe') ||
+        msg.includes('Failed to update header') ||
+        msg.includes('Error writing trailer') ||
+        msg.includes('Connection reset by peer') ||
+        msg.includes('RTMP_SendPacket') ||
+        msg.includes('Server error')
+      ) {
+        const cur = activeStreams.get(streamId);
+        if (cur && !cur.restarting) {
+          cur.restarting = true;
+          try { cur.proc.kill('SIGKILL'); } catch(e) {}
+        }
+      }
+    });
+    proc.on('close', () => {
+      const current = activeStreams.get(streamId);
+      if (current && !current.restarting) {
+        setTimeout(() => {
+          const cur = activeStreams.get(streamId);
+          if (cur && !cur.restarting) startFFmpeg(streamId, cur.streamData);
+        }, 3000);
+      }
+    });
+  }
+
   const existing = activeStreams.get(streamId);
   if (existing) {
     existing.restarting = true;
+    existing.proc.once('close', () => {
+      setTimeout(spawnNew, 1500);
+    });
     try { existing.proc.kill('SIGKILL'); } catch(e) {}
+  } else {
+    spawnNew();
   }
-  const args = buildFFmpegArgs(streamData);
-  const proc = spawn('ffmpeg', args);
-  const entry = { proc, restarting: false, streamData: { ...streamData } };
-  activeStreams.set(streamId, entry);
-  proc.stderr.on('data', () => {});
-  proc.on('close', () => {
-    const current = activeStreams.get(streamId);
-    if (current && !current.restarting) {
-      setTimeout(() => {
-        const cur = activeStreams.get(streamId);
-        if (cur && !cur.restarting) startFFmpeg(streamId, cur.streamData);
-      }, 3000);
-    }
-  });
 }
 
 // ==================== SHARED NAV HELPERS ====================
@@ -1005,12 +1067,7 @@ a{text-decoration:none;color:inherit;}
     <hr class="section-divider"/>
     <div class="section-heading">🎬 Video / Image</div>
     <div id="preview-container"></div>
-    <div class="volume-row">
-      <label>Video volume</label>
-      <input type="range" id="video-vol" min="0" max="100" value="100" oninput="onVolChange('video')"/>
-      <span class="vol-val" id="video-vol-val">100%</span>
-      <button class="mute-btn" id="video-mute-btn" onclick="toggleMute('video')">Mute</button>
-    </div>
+    <div style="font-size:12px;color:#555;background:#1a1a1a;border:1px solid #222;border-radius:8px;padding:8px 12px;margin-top:8px;display:flex;align-items:center;gap:6px;">🔇 Video audio is muted — use audio tracks below to add music</div>
     <hr class="section-divider"/>
     <div class="section-heading">🎵 Audio Tracks <span style="font-size:11px;color:#555;font-weight:400;text-transform:none;letter-spacing:0;">(play sequentially, loop forever)</span></div>
     <div class="audio-tracks-list" id="audio-tracks-list"></div>
@@ -1547,6 +1604,25 @@ async function startStream(id) {
   } catch(e) { alert('Failed to start stream.'); location.reload(); }
 }
 
+(function pollEncoding() {
+  var processingIds = Object.values(allStreams).filter(s => s.encode_status === 'encoding').map(s => s.id);
+  if (processingIds.length === 0) return;
+  processingIds.forEach(function(id) {
+    fetch('/api/streams/' + id + '/encode-status')
+      .then(r => r.json())
+      .then(data => {
+        var bar = document.getElementById('enc-bar-' + id);
+        var label = document.getElementById('enc-label-' + id);
+        if (bar) bar.style.width = data.encode_progress + '%';
+        if (label) label.textContent = '⚙️ Optimizing video for streaming... ' + data.encode_progress + '%';
+        if (data.encode_status === 'ready' || data.encode_status === 'failed') {
+          setTimeout(() => location.reload(), 1000);
+        }
+      }).catch(() => {});
+  });
+  setTimeout(pollEncoding, 2000);
+})();
+
 async function stopStream(id) {
   await fetch('/api/streams/' + id + '/stop', { method: 'POST' });
   location.reload();
@@ -1725,12 +1801,31 @@ app.post('/api/streams/:id/upload-video', requireAuthApi, upload.single('file'),
     const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
     if (!stream) return res.status(404).json({ error: 'Stream not found' });
     if (stream.file_path && fs.existsSync(stream.file_path)) { try { fs.unlinkSync(stream.file_path); } catch(e) {} }
+    if (stream.encoded_path && fs.existsSync(stream.encoded_path)) { try { fs.unlinkSync(stream.encoded_path); } catch(e) {} }
     if (stream.thumb_path) { const tp = path.join(THUMB_DIR, path.basename(stream.thumb_path)); if (fs.existsSync(tp)) { try { fs.unlinkSync(tp); } catch(e) {} } }
     const thumbPath = await generateThumb(req.file.path, req.params.id);
-    await pool.query('UPDATE streams SET file_path=$1,file_name=$2,thumb_path=$3 WHERE id=$4', [req.file.path, req.file.originalname, thumbPath, req.params.id]);
-    const active = activeStreams.get(parseInt(req.params.id));
-    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
+    await pool.query('UPDATE streams SET file_path=$1,file_name=$2,thumb_path=$3,encoded_path=NULL,encode_status=$4,encode_progress=$5 WHERE id=$6',
+      [req.file.path, req.file.originalname, thumbPath, 'none', 0, req.params.id]);
     res.json({ success: true, thumb_path: thumbPath });
+    const updatedStream = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0];
+    preEncodeFile(parseInt(req.params.id), req.file.path, updatedStream.resolution)
+      .then(() => {
+        const active = activeStreams.get(parseInt(req.params.id));
+        if (active) {
+          pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id]).then(r => {
+            if (r.rows[0]) startFFmpeg(parseInt(req.params.id), r.rows[0]);
+          });
+        }
+      })
+      .catch(console.error);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/streams/:id/encode-status', requireAuthApi, async (req, res) => {
+  try {
+    const stream = (await pool.query('SELECT encode_status, encode_progress FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
+    if (!stream) return res.status(404).json({ error: 'Stream not found' });
+    res.json(stream);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1752,7 +1847,7 @@ app.post('/api/streams/:id/start', requireAuthApi, async (req, res) => {
   try {
     const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
     if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    if (!stream.file_path || !fs.existsSync(stream.file_path)) return res.status(400).json({ error: 'No video/image file uploaded' });
+    if (!stream.encoded_path || !fs.existsSync(stream.encoded_path)) return res.status(400).json({ error: 'Video is still processing. Please wait.' });
     if (!stream.stream_key) return res.status(400).json({ error: 'No stream key set' });
     startFFmpeg(stream.id, stream);
     await pool.query('UPDATE streams SET status=$1 WHERE id=$2', ['live', stream.id]);
