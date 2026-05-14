@@ -267,20 +267,25 @@ function buildFFmpegArgs(stream) {
   // Video input — pre-encoded, just copy bytes
   args.push('-thread_queue_size', '4096', '-re', '-stream_loop', '-1', '-i', stream.encoded_path);
 
-  // Video: copy, no re-encoding
-  args.push('-c:v', 'copy');
-
-  // Audio — use premixed file if available, otherwise silence
+// Audio — use premixed file if available, otherwise silence
   const hasPremix = stream.premix_path && fs.existsSync(stream.premix_path);
   if (hasPremix) {
     args.push('-thread_queue_size', '4096', '-stream_loop', '-1', '-i', stream.premix_path);
+  } else {
+    args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo');
+  }
+
+  // Video: copy, no re-encoding
+  args.push('-c:v', 'copy');
+
+  if (hasPremix) {
     if (audioVol !== 1) {
       args.push('-filter_complex', `[1:a]volume=${audioVol}[aout]`, '-map', '0:v', '-map', '[aout]');
     } else {
       args.push('-map', '0:v', '-map', '1:a');
     }
   } else {
-    args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-map', '0:v', '-map', '1:a');
+    args.push('-map', '0:v', '-map', '1:a');
   }
 
   args.push(
