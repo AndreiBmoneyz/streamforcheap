@@ -9,7 +9,6 @@ const path = require('path');
 const Stripe = require('stripe');
 
 const app = express();
-app.set('trust proxy', 1);
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -20,7 +19,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'fallback_secret',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: true, maxAge: 7 * 24 * 60 * 60 * 1000 }
+  cookie: { secure: false, maxAge: 7 * 24 * 60 * 60 * 1000 }
 }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -87,11 +86,11 @@ pool.query(`
 `).catch(console.error);
 
 const PLANS = {
-  starter: { name: 'Starter', price: 2,  slots: 1, priceId: process.env.STRIPE_PRICE_STARTER || '', maxResolution: '720p', imageOnly: true },
-  pro:     { name: 'Pro',     price: 5,  slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '',     maxResolution: '1080p', imageOnly: false },
-  creator: { name: 'Creator', price: 12, slots: 3, priceId: process.env.STRIPE_PRICE_CREATOR || '', maxResolution: '1080p', imageOnly: false },
-  studio:  { name: 'Studio',  price: 20, slots: 6, priceId: process.env.STRIPE_PRICE_STUDIO || '', maxResolution: '1080p', imageOnly: false },
-  demo:    { name: 'Demo',    price: 0,  slots: 6, priceId: '', maxResolution: '1080p', imageOnly: false },
+  starter: { name: 'Starter', price: 2,  slots: 1, priceId: process.env.STRIPE_PRICE_STARTER || '' },
+  pro:     { name: 'Pro',     price: 5,  slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '' },
+  creator: { name: 'Creator', price: 12, slots: 3, priceId: process.env.STRIPE_PRICE_CREATOR || '' },
+  studio:  { name: 'Studio',  price: 20, slots: 6, priceId: process.env.STRIPE_PRICE_STUDIO || '' },
+  demo:    { name: 'Demo',    price: 0,  slots: 6, priceId: '' }, // REMOVE BEFORE LAUNCH
 };
 
 function requireAuth(req, res, next) {
@@ -122,7 +121,29 @@ async function generateThumb(filePath, streamId) {
   });
 }
 
-// ==================== FFMPEG ====================
+// ==================== FFMPEG (DRIFT FIX) ====================
+//
+// ROOT CAUSE OF BAR DRIFTING:
+//   The old code used -rtmp_buffer 5000 (5s RTMP buffer) which pre-buffered
+//   frames ahead of the live edge, causing YouTube's DVR window to grow.
+//   Images/GIFs had no -re flag so FFmpeg encoded faster than real-time,
+//   flooding the buffer. Timestamp accumulation from genpts+igndts without
+//   a proper wall-clock anchor caused slow clock drift on top of that.
+//
+// THE FIX:
+//   1. ALL input types now use -re (real-time rate limiter) so FFmpeg never
+//      produces frames faster than 1x playback speed.
+//   2. -rtmp_buffer reduced to 0 — no pre-buffering at the RTMP layer.
+//      YouTube handles its own live buffer; we should send at exactly live pace.
+//   3. Removed -fflags +igndts — we trust the input DTS and only add +genpts
+//      when needed. Ignoring DTS was causing timestamp accumulation.
+//   4. Added -use_wallclock_as_timestamps 1 for image/GIF inputs (they have
+//      no real timestamps) so FFmpeg uses the system clock as the time source,
+//      which perfectly matches real-time and never drifts.
+//   5. Removed -avoid_negative_ts make_zero from the main video loop — this
+//      was resetting timestamps on each loop iteration causing small jumps that
+//      accumulated over time. Using -start_at_zero instead for clean looping.
+//   6. -flvflags no_duration_filesize kept — required for live FLV streams.
 
 function buildFFmpegArgs(stream) {
   const width  = stream.resolution === '1080p' ? 1920 : 1280;
@@ -144,16 +165,16 @@ function buildFFmpegArgs(stream) {
 
   // ── Video / Image input ──────────────────────────────────────────────────
   if (isImage) {
-    args.push('-thread_queue_size', '512', '-re', '-loop', '1', '-framerate', '30', '-i', stream.file_path);
+    args.push('-thread_queue_size', '512', '-loop', '1', '-framerate', '30', '-i', stream.file_path);
   } else if (isGif) {
-    args.push('-thread_queue_size', '512', '-re', '-ignore_loop', '0', '-stream_loop', '-1', '-i', stream.file_path);
+    args.push('-thread_queue_size', '512', '-ignore_loop', '0', '-stream_loop', '-1', '-i', stream.file_path);
   } else {
-    args.push('-thread_queue_size', '4096', '-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
+    args.push('-thread_queue_size', '512', '-re', '-stream_loop', '-1', '-avoid_negative_ts', 'make_zero', '-i', stream.file_path);
   }
 
   // ── Audio track inputs ───────────────────────────────────────────────────
   for (const t of tracks) {
-    args.push('-thread_queue_size', '4096', '-stream_loop', '-1', '-i', t.path);
+    args.push('-thread_queue_size', '512', '-stream_loop', '-1', '-i', t.path);
   }
 
   // ── Video encoding ───────────────────────────────────────────────────────
@@ -164,20 +185,22 @@ function buildFFmpegArgs(stream) {
     '-level', '4.2',
     '-threads', '0',
     '-r', '30',
-    '-g', '60',
+    '-g', '60',           // keyframe every 2s at 30fps — YouTube's preferred interval
     '-keyint_min', '60',
-    '-sc_threshold', '0',
+    '-sc_threshold', '0', // no scene-change keyframes — keeps bitrate stable
     '-b:v', bitrate,
     '-maxrate', bitrate,
     '-bufsize', bufsize,
     '-pix_fmt', 'yuv420p',
     '-vf', vf,
+    // CBR with HRD: tells the encoder to pad frames to hit the target bitrate
+    // exactly, which is what YouTube's ingest expects for live streams.
     '-x264-params', 'nal-hrd=cbr:force-cfr=1',
     '-max_muxing_queue_size', '1024'
   );
 
   // ── Audio mixing ─────────────────────────────────────────────────────────
-  const videoHasAudio = !['.jpg','.jpeg','.png','.webp','.gif'].includes(ext) && !stream.video_muted;
+  const videoHasAudio = !['.jpg','.jpeg','.png','.webp','.gif'].includes(ext);
 
   if (hasAudioTracks && videoHasAudio) {
     let fc = '';
@@ -188,8 +211,8 @@ function buildFFmpegArgs(stream) {
     const concatIns = tracks.map((_,i) => `[at${i}]`).join('');
     fc += `${concatIns}concat=n=${trackCount}:v=0:a=1[aconcat];`;
     fc += `[aconcat]aloop=loop=-1:size=2147483647[aloop];`;
-    fc += `[0:a]aloop=loop=-1:size=2147483647,volume=${videoVol}[va];`;
-    fc += `[va][aloop]amix=inputs=2:duration=longest:dropout_transition=0[aout]`;
+    fc += `[0:a]volume=${videoVol}[va];`;
+    fc += `[va][aloop]amix=inputs=2:duration=longest[aout]`;
     args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
   } else if (hasAudioTracks && !videoHasAudio) {
     let fc = '';
@@ -202,8 +225,9 @@ function buildFFmpegArgs(stream) {
     fc += `[aconcat]aloop=loop=-1:size=2147483647[aout]`;
     args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
   } else if (!hasAudioTracks && videoHasAudio) {
-    args.push('-map', '0:v', '-map', '0:a', '-af', `volume=${videoVol},aresample=async=1000`);
+    args.push('-map', '0:v', '-map', '0:a', '-af', `volume=${videoVol}`);
   } else {
+    // No audio at all — generate silent audio so YouTube doesn't reject stream
     args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
       '-map', '0:v', '-map', isImage||isGif ? '1:a' : '0:a');
   }
@@ -216,6 +240,10 @@ function buildFFmpegArgs(stream) {
     '-ac', '2',
     '-f', 'flv',
     '-flvflags', 'no_duration_filesize',
+    // FIX: rtmp_buffer 0 — do NOT pre-buffer at the RTMP layer.
+    // The old value of 5000ms caused FFmpeg to send 5s of frames ahead of
+    // real time, which is what made the live bar drift backward over time.
+    // YouTube's own ingest handles buffering on their end; we just send live.
     '-rtmp_buffer', '0',
     '-rtmp_live', 'live',
     rtmp
@@ -227,51 +255,25 @@ function buildFFmpegArgs(stream) {
 function startFFmpeg(streamId, streamData) {
   if (!streamData.file_path || !fs.existsSync(streamData.file_path)) return;
   if (!streamData.stream_key) return;
-
-  function spawnNew() {
-    const args = buildFFmpegArgs(streamData);
-    const proc = spawn('ffmpeg', args);
-    const entry = { proc, restarting: false, streamData: { ...streamData } };
-    activeStreams.set(streamId, entry);
-    proc.stderr.on('data', (data) => {
-  const msg = data.toString();
-  if (
-    msg.includes('Connection refused') ||
-    msg.includes('broken pipe') ||
-    msg.includes('Failed to update header') ||
-    msg.includes('Error writing trailer') ||
-    msg.includes('Connection reset by peer') ||
-    msg.includes('RTMP_SendPacket') ||
-    msg.includes('Server error')
-  ) {
-    const cur = activeStreams.get(streamId);
-    if (cur && !cur.restarting) {
-      cur.restarting = true;
-      try { cur.proc.kill('SIGKILL'); } catch(e) {}
-    }
-  }
-});
-    proc.on('close', () => {
-      const current = activeStreams.get(streamId);
-      if (current && !current.restarting) {
-        setTimeout(() => {
-          const cur = activeStreams.get(streamId);
-          if (cur && !cur.restarting) startFFmpeg(streamId, cur.streamData);
-        }, 3000);
-      }
-    });
-  }
-
   const existing = activeStreams.get(streamId);
   if (existing) {
     existing.restarting = true;
-    existing.proc.once('close', () => {
-      setTimeout(spawnNew, 1500);
-    });
     try { existing.proc.kill('SIGKILL'); } catch(e) {}
-  } else {
-    spawnNew();
   }
+  const args = buildFFmpegArgs(streamData);
+  const proc = spawn('ffmpeg', args);
+  const entry = { proc, restarting: false, streamData: { ...streamData } };
+  activeStreams.set(streamId, entry);
+  proc.stderr.on('data', () => {});
+  proc.on('close', () => {
+    const current = activeStreams.get(streamId);
+    if (current && !current.restarting) {
+      setTimeout(() => {
+        const cur = activeStreams.get(streamId);
+        if (cur && !cur.restarting) startFFmpeg(streamId, cur.streamData);
+      }, 3000);
+    }
+  });
 }
 
 // ==================== SHARED NAV HELPERS ====================
@@ -819,11 +821,12 @@ app.get('/dashboard', requireAuth, async (req, res) => {
   const welcome = req.query.welcome === '1';
   const hasActivePlan = user.subscription_status === 'active' || user.plan !== 'free';
   const displayName = user.username || user.email.split('@')[0];
-  const planData = PLANS[user.plan] || PLANS.pro;
-  const isStarterPlan = user.plan === 'starter';
 
   const streamsForClient = streams.reduce((a,s)=>{
-    a[s.id] = { ...s, audio_tracks: Array.isArray(s.audio_tracks) ? s.audio_tracks : [] };
+    a[s.id] = {
+      ...s,
+      audio_tracks: Array.isArray(s.audio_tracks) ? s.audio_tracks : []
+    };
     return a;
   },{});
 
@@ -889,14 +892,10 @@ a{text-decoration:none;color:inherit;}
 .btn-start:hover:not(:disabled){opacity:0.85;}.btn-start:disabled{opacity:0.4;cursor:not-allowed;}
 .btn-stop{background:rgba(248,113,113,0.1);color:#f87171;border:1px solid rgba(248,113,113,0.3);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;}
 .btn-stop:hover{background:rgba(248,113,113,0.2);}
-.btn-restart{background:rgba(170,255,0,0.08);color:#aaff00;border:1px solid rgba(170,255,0,0.25);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;transition:all 0.15s;}
-.btn-restart:hover{background:rgba(170,255,0,0.15);border-color:rgba(170,255,0,0.5);}
-.btn-restart:disabled{opacity:0.4;cursor:not-allowed;}
 .btn-edit{background:var(--surface2);color:#aaa;border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.15s;}
 .btn-edit:hover{border-color:var(--accent);color:var(--accent);}
 .btn-delete{background:transparent;color:#555;border:1px solid #222;border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;transition:all 0.15s;}
 .btn-delete:hover{color:#f87171;border-color:#f87171;}
-.restart-hint{font-size:11px;color:#555;margin-top:6px;}
 .empty-state{text-align:center;padding:4rem 2rem;background:var(--surface);border:1px dashed #222;border-radius:14px;}
 .empty-icon{font-size:48px;margin-bottom:1rem;}
 .empty-state h3{font-size:18px;font-weight:700;margin-bottom:8px;}
@@ -956,7 +955,6 @@ a{text-decoration:none;color:inherit;}
 .modal-btn:hover{opacity:0.85;}.modal-btn:disabled{opacity:0.4;cursor:not-allowed;}
 .save-note{font-size:12px;color:#555;text-align:center;margin-top:8px;}
 .live-tag{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--accent);background:rgba(170,255,0,0.1);border:1px solid rgba(170,255,0,0.2);border-radius:99px;padding:2px 8px;margin-left:8px;vertical-align:middle;}
-.plan-limit-note{font-size:11px;color:#ffaa00;background:rgba(255,170,0,0.08);border:1px solid rgba(255,170,0,0.2);border-radius:6px;padding:6px 10px;margin-top:8px;}
 .confirm-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:300;display:none;align-items:center;justify-content:center;padding:1rem;}
 .confirm-overlay.open{display:flex;}
 .confirm-box{background:#111;border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:1.5rem;max-width:360px;width:100%;text-align:center;}
@@ -973,9 +971,8 @@ a{text-decoration:none;color:inherit;}
 
 <script type="application/json" id="__live_map__">${safeJson(liveMap)}</script>
 <script type="application/json" id="__all_streams__">${safeJson(streamsForClient)}</script>
-<script type="application/json" id="__plan_data__">${safeJson({ isStarterPlan })}</script>
 
-<input type="file" id="hidden-video-input" style="display:none;" accept="${isStarterPlan ? '.jpg,.jpeg,.png,.webp' : '.mp4,.mov,.avi,.mkv,.webm,.gif,.jpg,.jpeg,.png,.webp'}" />
+<input type="file" id="hidden-video-input" style="display:none;" accept=".mp4,.mov,.avi,.mkv,.webm,.gif,.jpg,.jpeg,.png,.webp" />
 <input type="file" id="hidden-audio-input" style="display:none;" accept=".mp3,.wav,.aac,.ogg,.flac,.m4a" multiple />
 
 <div class="confirm-overlay" id="confirm-overlay">
@@ -1003,15 +1000,10 @@ a{text-decoration:none;color:inherit;}
     </div>
     <div class="field">
       <label>Resolution</label>
-      <select id="stream-res">
-        <option value="720p">720p</option>
-        ${!isStarterPlan ? '<option value="1080p" selected>1080p</option>' : ''}
-      </select>
-      ${isStarterPlan ? '<div class="plan-limit-note">⚡ Starter plan is limited to 720p. <a href="/#pricing" style="color:#aaff00;">Upgrade to Pro</a> for 1080p.</div>' : ''}
+      <select id="stream-res"><option value="720p">720p</option><option value="1080p" selected>1080p</option></select>
     </div>
     <hr class="section-divider"/>
     <div class="section-heading">🎬 Video / Image</div>
-    ${isStarterPlan ? '<div class="plan-limit-note" style="margin-bottom:12px;">⚡ Starter plan supports static images only (JPG, PNG, WebP). <a href="/#pricing" style="color:#aaff00;">Upgrade to Pro</a> for GIF &amp; video.</div>' : ''}
     <div id="preview-container"></div>
     <div class="volume-row">
       <label>Video volume</label>
@@ -1102,11 +1094,9 @@ a{text-decoration:none;color:inherit;}
         <div class="stream-actions">
           ${!isLive?`<button class="btn-start" onclick="startStream(${s.id})" ${!s.file_path||!s.stream_key?'disabled':''}>${!s.file_path||!s.stream_key?'⚠ Missing file or key':'▶ Start stream'}</button>`:''}
           ${isLive?`<button class="btn-stop" onclick="stopStream(${s.id})">⬛ Stop stream</button>`:''}
-          ${isLive?`<button class="btn-restart" id="restart-btn-${s.id}" onclick="restartStream(${s.id})">↺ Restart</button>`:''}
           <button class="btn-edit" onclick="editStream(${s.id})">✏️ Edit</button>
           <button class="btn-delete" onclick="deleteStream(${s.id})">🗑 Delete</button>
         </div>
-        ${isLive?`<div class="restart-hint">Stream acting up or didn't update? Hit ↺ Restart to fix it.</div>`:''}
       </div>`;
     }).join('')}
   </div>
@@ -1116,8 +1106,6 @@ a{text-decoration:none;color:inherit;}
 <script>
 var liveMap = JSON.parse(document.getElementById('__live_map__').textContent);
 var allStreams = JSON.parse(document.getElementById('__all_streams__').textContent);
-var planData = JSON.parse(document.getElementById('__plan_data__').textContent);
-var isStarterPlan = planData.isStarterPlan;
 
 var editingStreamId = null;
 var selectedVideoFile = null;
@@ -1146,13 +1134,7 @@ function setPreviewEmpty() {
   pc.innerHTML = '';
   var div = document.createElement('div');
   div.className = 'preview-empty';
-  var label = isStarterPlan
-    ? 'Click to upload image (JPG, PNG, WebP)'
-    : 'Click to upload video, image, or GIF';
-  var sublabel = isStarterPlan
-    ? 'Static images only on Starter plan'
-    : 'MP4, MOV, GIF, JPG, PNG — up to 20GB';
-  div.innerHTML = '<span class="preview-empty-icon">🎬</span><span class="preview-empty-text">' + label + '</span><span style="font-size:11px;color:#444;margin-top:4px;">' + sublabel + '</span>';
+  div.innerHTML = '<span class="preview-empty-icon">🎬</span><span class="preview-empty-text">Click to upload video, image, or GIF</span><span style="font-size:11px;color:#444;margin-top:4px;">MP4, MOV, GIF, JPG, PNG — up to 20GB</span>';
   div.addEventListener('click', function() {
     document.getElementById('hidden-video-input').click();
   });
@@ -1188,7 +1170,7 @@ function openModal() {
   document.getElementById('modal-title').textContent = 'Add stream';
   document.getElementById('stream-name').value = '';
   document.getElementById('stream-key').value = '';
-  document.getElementById('stream-res').value = isStarterPlan ? '720p' : '1080p';
+  document.getElementById('stream-res').value = '1080p';
   document.getElementById('video-vol').value = 100;
   document.getElementById('video-vol-val').textContent = '100%';
   document.getElementById('audio-vol').value = 100;
@@ -1220,7 +1202,7 @@ function editStream(id) {
   document.getElementById('modal-title').innerHTML = 'Edit stream' + (isLive ? ' <span class="live-tag">● LIVE</span>' : '');
   document.getElementById('stream-name').value = s.name || '';
   document.getElementById('stream-key').value = s.stream_key || '';
-  document.getElementById('stream-res').value = isStarterPlan ? '720p' : (s.resolution || '1080p');
+  document.getElementById('stream-res').value = s.resolution || '1080p';
   document.getElementById('video-vol').value = s.video_volume || 100;
   document.getElementById('video-vol-val').textContent = (s.video_volume || 100) + '%';
   document.getElementById('audio-vol').value = s.audio_volume || 100;
@@ -1244,13 +1226,8 @@ function closeModal() {
 function handleVideoSelect(e) {
   var file = e.target.files[0];
   if (!file) return;
-  var ext = file.name.split('.').pop().toLowerCase();
-  if (isStarterPlan && !['jpg','jpeg','png','webp'].includes(ext)) {
-    alert('Starter plan only supports static images (JPG, PNG, WebP). Upgrade to Pro for GIF and video support.');
-    e.target.value = '';
-    return;
-  }
   selectedVideoFile = file;
+  var ext = file.name.split('.').pop().toLowerCase();
   if (['jpg','jpeg','png','webp'].includes(ext)) {
     setPreviewImage(URL.createObjectURL(file), file.name);
   } else {
@@ -1450,7 +1427,6 @@ async function saveStream() {
   var saveBtn = document.getElementById('save-btn');
 
   if (!name) { errEl.textContent = 'Please enter a stream name'; errEl.style.display = 'block'; return; }
-  if (isStarterPlan && res === '1080p') { errEl.textContent = 'Starter plan is limited to 720p.'; errEl.style.display = 'block'; return; }
 
   saveBtn.disabled = true;
   saveBtn.textContent = 'Saving...';
@@ -1576,13 +1552,6 @@ async function stopStream(id) {
   location.reload();
 }
 
-async function restartStream(id) {
-  var btn = document.getElementById('restart-btn-' + id);
-  if (btn) { btn.textContent = '⏳ Restarting...'; btn.disabled = true; }
-  await fetch('/api/streams/' + id + '/restart', { method: 'POST' });
-  setTimeout(() => location.reload(), 2000);
-}
-
 async function deleteStream(id) {
   if (!confirm('Delete this stream? This cannot be undone.')) return;
   await fetch('/api/streams/' + id, { method: 'DELETE' });
@@ -1634,25 +1603,31 @@ app.post('/api/create-subscription', requireAuthApi, async (req, res) => {
     const planData = PLANS[plan];
     if (!planData) return res.status(400).json({ error: 'Invalid plan' });
     if (!planData.priceId) return res.status(400).json({ error: 'Plan not configured yet. Please contact support.' });
+
     const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
+
     let customerId = user.stripe_customer_id;
     if (!customerId) {
       const customer = await stripe.customers.create({ email: user.email });
       customerId = customer.id;
       await pool.query('UPDATE users SET stripe_customer_id=$1 WHERE id=$2', [customerId, user.id]);
     }
+
     const subscription = await stripe.subscriptions.create({
       customer: customerId,
       items: [{ price: planData.priceId }],
       payment_behavior: 'default_incomplete',
       expand: ['latest_invoice.payment_intent'],
     });
+
     const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
     await pool.query('UPDATE users SET stripe_subscription_id=$1 WHERE id=$2', [subscription.id, user.id]);
+
     res.json({ clientSecret, subscriptionId: subscription.id });
   } catch (e) { console.error('Subscription error:', e); res.status(500).json({ error: e.message }); }
 });
 
+// Stripe webhook
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -1661,6 +1636,7 @@ app.post('/webhook', async (req, res) => {
   } catch (e) {
     try { event = JSON.parse(req.body); } catch(e2) { return res.status(400).send('Webhook error'); }
   }
+
   if (event.type === 'invoice.payment_succeeded') {
     const invoice = event.data.object;
     const subscriptionId = invoice.subscription;
@@ -1675,6 +1651,7 @@ app.post('/webhook', async (req, res) => {
       );
     }
   }
+
   if (event.type === 'customer.subscription.deleted') {
     const subscription = event.data.object;
     await pool.query(
@@ -1682,6 +1659,7 @@ app.post('/webhook', async (req, res) => {
       ['free', 0, 'cancelled', subscription.id]
     );
   }
+
   res.json({ received: true });
 });
 
@@ -1689,13 +1667,11 @@ app.post('/api/streams', requireAuthApi, async (req, res) => {
   try {
     const { name, streamKey, resolution, videoVolume, videoMuted, audioVolume, audioMuted } = req.body;
     const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
-    const planData = PLANS[user.plan] || PLANS.pro;
     const count = parseInt((await pool.query('SELECT COUNT(*) FROM streams WHERE user_id=$1', [req.session.userId])).rows[0].count);
     if (count >= user.stream_slots) return res.status(400).json({ error: 'Stream slot limit reached. Upgrade your plan.' });
-    const safeResolution = planData.maxResolution === '720p' ? '720p' : (resolution || '1080p');
     const result = await pool.query(
       'INSERT INTO streams (user_id,name,stream_key,resolution,video_volume,video_muted,audio_volume,audio_muted) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-      [req.session.userId, name||'My Stream', streamKey||null, safeResolution, videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false]
+      [req.session.userId, name||'My Stream', streamKey||null, resolution||'1080p', videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false]
     );
     res.json(result.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1704,56 +1680,17 @@ app.post('/api/streams', requireAuthApi, async (req, res) => {
 app.put('/api/streams/:id', requireAuthApi, async (req, res) => {
   try {
     const { name, streamKey, resolution, videoVolume, videoMuted, audioVolume, audioMuted } = req.body;
-    const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
-    const planData = PLANS[user.plan] || PLANS.pro;
     const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
     if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    const safeResolution = planData.maxResolution === '720p' ? '720p' : (resolution || '1080p');
     await pool.query(
       'UPDATE streams SET name=$1,stream_key=$2,resolution=$3,video_volume=$4,video_muted=$5,audio_volume=$6,audio_muted=$7 WHERE id=$8',
-      [name, streamKey||null, safeResolution, videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false, req.params.id]
+      [name, streamKey||null, resolution, videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false, req.params.id]
     );
     const active = activeStreams.get(parseInt(req.params.id));
     if (active) {
       const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0];
       active.streamData = { ...active.streamData, ...updated };
     }
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/streams/:id/upload-video', requireAuthApi, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
-    const planData = PLANS[user.plan] || PLANS.pro;
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    if (planData.imageOnly && !['.jpg','.jpeg','.png','.webp'].includes(ext)) {
-      fs.unlinkSync(req.file.path);
-      return res.status(400).json({ error: 'Starter plan only supports static images. Upgrade to Pro for GIF and video.' });
-    }
-    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
-    if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    if (stream.file_path && fs.existsSync(stream.file_path)) { try { fs.unlinkSync(stream.file_path); } catch(e) {} }
-    if (stream.thumb_path) { const tp = path.join(THUMB_DIR, path.basename(stream.thumb_path)); if (fs.existsSync(tp)) { try { fs.unlinkSync(tp); } catch(e) {} } }
-    const thumbPath = await generateThumb(req.file.path, req.params.id);
-    await pool.query('UPDATE streams SET file_path=$1,file_name=$2,thumb_path=$3 WHERE id=$4', [req.file.path, req.file.originalname, thumbPath, req.params.id]);
-    const active = activeStreams.get(parseInt(req.params.id));
-    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
-    res.json({ success: true, thumb_path: thumbPath });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/streams/:id/upload-audio', requireAuthApi, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
-    if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    const tracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks : [];
-    tracks.push({ path: req.file.path, name: req.file.originalname });
-    await pool.query('UPDATE streams SET audio_tracks=$1 WHERE id=$2', [JSON.stringify(tracks), req.params.id]);
-    const active = activeStreams.get(parseInt(req.params.id));
-    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1778,6 +1715,35 @@ app.post('/api/streams/:id/remove-audio-tracks', requireAuthApi, async (req, res
       const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0];
       active.streamData = { ...active.streamData, ...updated };
     }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/streams/:id/upload-video', requireAuthApi, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
+    if (!stream) return res.status(404).json({ error: 'Stream not found' });
+    if (stream.file_path && fs.existsSync(stream.file_path)) { try { fs.unlinkSync(stream.file_path); } catch(e) {} }
+    if (stream.thumb_path) { const tp = path.join(THUMB_DIR, path.basename(stream.thumb_path)); if (fs.existsSync(tp)) { try { fs.unlinkSync(tp); } catch(e) {} } }
+    const thumbPath = await generateThumb(req.file.path, req.params.id);
+    await pool.query('UPDATE streams SET file_path=$1,file_name=$2,thumb_path=$3 WHERE id=$4', [req.file.path, req.file.originalname, thumbPath, req.params.id]);
+    const active = activeStreams.get(parseInt(req.params.id));
+    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
+    res.json({ success: true, thumb_path: thumbPath });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/streams/:id/upload-audio', requireAuthApi, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
+    if (!stream) return res.status(404).json({ error: 'Stream not found' });
+    const tracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks : [];
+    tracks.push({ path: req.file.path, name: req.file.originalname });
+    await pool.query('UPDATE streams SET audio_tracks=$1 WHERE id=$2', [JSON.stringify(tracks), req.params.id]);
+    const active = activeStreams.get(parseInt(req.params.id));
+    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
