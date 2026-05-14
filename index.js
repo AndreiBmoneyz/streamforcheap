@@ -260,7 +260,6 @@ async function preEncodeFile(streamId, filePath, resolution) {
 //   6. -flvflags no_duration_filesize kept — required for live FLV streams.
 
 function buildFFmpegArgs(stream) {
-  const audioVol = stream.audio_muted ? 0 : (stream.audio_volume || 100) / 100;
   const rtmp = `rtmp://a.rtmp.youtube.com/live2/${stream.stream_key}`;
   const args = [];
 
@@ -269,36 +268,27 @@ function buildFFmpegArgs(stream) {
 
 // Audio — use premixed file if available, otherwise silence
   const hasPremix = stream.premix_path && fs.existsSync(stream.premix_path);
-  if (hasPremix) {
-    args.push('-thread_queue_size', '4096', '-stream_loop', '-1', '-i', stream.premix_path);
-  } else {
-    args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo');
-  }
+ args.push('-map', '0:v', '-map', '1:a');
+
 
   // Video: copy, no re-encoding
   args.push('-c:v', 'copy');
 
   if (hasPremix) {
-    if (audioVol !== 1) {
-      args.push('-filter_complex', `[1:a]volume=${audioVol}[aout]`, '-map', '0:v', '-map', '[aout]');
-    } else {
-      args.push('-map', '0:v', '-map', '1:a');
-    }
+  args.push('-map', '0:v', '-map', '1:a');
+
   } else {
     args.push('-map', '0:v', '-map', '1:a');
   }
 
   args.push(
-    '-c:a', 'aac',
-    '-b:a', '128k',
-    '-ar', '44100',
-    '-ac', '2',
-    '-f', 'flv',
-    '-flvflags', 'no_duration_filesize',
-    '-rtmp_buffer', '0',
-    '-rtmp_live', 'live',
-    rtmp
-  );
+  '-c:a', 'copy',
+  '-f', 'flv',
+  '-flvflags', 'no_duration_filesize',
+  '-rtmp_buffer', '0',
+  '-rtmp_live', 'live',
+  rtmp
+);
 
   return args;
 }
@@ -1089,12 +1079,6 @@ a{text-decoration:none;color:inherit;}
     <div class="add-audio-row">
       <button class="add-audio-btn" id="add-audio-btn">+ Add audio track</button>
     </div>
-    <div class="volume-row" style="margin-top:12px;">
-      <label>Audio volume</label>
-      <input type="range" id="audio-vol" min="0" max="100" value="100" oninput="onVolChange('audio')"/>
-      <span class="vol-val" id="audio-vol-val">100%</span>
-      <button class="mute-btn" id="audio-mute-btn" onclick="toggleMute()">Mute</button>
-    </div>
     <div class="progress-wrap" id="upload-progress">
       <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
       <div class="progress-label" id="progress-label">Uploading...</div>
@@ -1185,8 +1169,6 @@ var savedTracks = [];
 var removedSavedIndices = [];
 var newAudioFiles = [];
 var newAudioDurations = [];
-var audioMuted = false;
-var volDebounce = null;
 var pendingRemoveIndex = null;
 var pendingRemoveType = null;
 
@@ -1236,14 +1218,10 @@ function openModal() {
   removedSavedIndices = [];
   newAudioFiles = [];
   newAudioDurations = [];
-  audioMuted = false;
   document.getElementById('modal-title').textContent = 'Add stream';
   document.getElementById('stream-name').value = '';
   document.getElementById('stream-key').value = '';
   document.getElementById('stream-res').value = '1080p';
-  document.getElementById('audio-vol').value = 100;
-  document.getElementById('audio-vol-val').textContent = '100%';
-  document.getElementById('audio-mute-btn').className = 'mute-btn';
   document.getElementById('modal-error').style.display = 'none';
   document.getElementById('upload-progress').style.display = 'none';
   document.getElementById('save-btn').disabled = false;
@@ -1263,15 +1241,11 @@ function editStream(id) {
   newAudioFiles = [];
   newAudioDurations = [];
   selectedVideoFile = null;
-  audioMuted = s.audio_muted || false;
   var isLive = liveMap[id] || false;
   document.getElementById('modal-title').innerHTML = 'Edit stream' + (isLive ? ' <span class="live-tag">● LIVE</span>' : '');
   document.getElementById('stream-name').value = s.name || '';
   document.getElementById('stream-key').value = s.stream_key || '';
   document.getElementById('stream-res').value = s.resolution || '1080p';
-  document.getElementById('audio-vol').value = s.audio_volume || 100;
-  document.getElementById('audio-vol-val').textContent = (s.audio_volume || 100) + '%';
-  document.getElementById('audio-mute-btn').className = 'mute-btn' + (audioMuted ? ' muted' : '');
   document.getElementById('modal-error').style.display = 'none';
   document.getElementById('upload-progress').style.display = 'none';
   document.getElementById('save-btn').disabled = false;
@@ -1428,54 +1402,11 @@ function moveNewTrack(i, dir) {
   renderAudioTracks();
 }
 
-function onVolChange(type) {
-  var val = parseInt(document.getElementById(type + '-vol').value);
-  document.getElementById(type + '-vol-val').textContent = val + '%';
-  if (type === 'video' && videoMuted && val > 0) { videoMuted = false; document.getElementById('video-mute-btn').className = 'mute-btn'; }
-  if (type === 'audio' && audioMuted && val > 0) { audioMuted = false; document.getElementById('audio-mute-btn').className = 'mute-btn'; }
-  if (editingStreamId && liveMap[editingStreamId]) {
-    clearTimeout(volDebounce);
-    volDebounce = setTimeout(async function() {
-      await saveMetaNow();
-      await fetch('/api/streams/' + editingStreamId + '/restart', { method: 'POST' });
-    }, 500);
-  }
-}
-
-function toggleMute() {
-  audioMuted = !audioMuted;
-  document.getElementById('audio-mute-btn').className = 'mute-btn' + (audioMuted ? ' muted' : '');
-  document.getElementById('audio-vol').value = audioMuted ? 0 : 100;
-  document.getElementById('audio-vol-val').textContent = audioMuted ? '0%' : '100%';
-  if (editingStreamId && liveMap[editingStreamId]) {
-    clearTimeout(volDebounce);
-    volDebounce = setTimeout(async function() {
-      await saveMetaNow();
-      await fetch('/api/streams/' + editingStreamId + '/restart', { method: 'POST' });
-    }, 500);
-  }
-}
-
-async function saveMetaNow() {
-  if (!editingStreamId) return;
-  await fetch('/api/streams/' + editingStreamId, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      name: document.getElementById('stream-name').value.trim(),
-      streamKey: document.getElementById('stream-key').value.trim(),
-      resolution: document.getElementById('stream-res').value,
-      audioVolume: parseInt(document.getElementById('audio-vol').value),
-      audioMuted: audioMuted
-    })
-  });
-}
 
 async function saveStream() {
   var name = document.getElementById('stream-name').value.trim();
   var key = document.getElementById('stream-key').value.trim();
   var res = document.getElementById('stream-res').value;
-  var audioVol = parseInt(document.getElementById('audio-vol').value);
   var errEl = document.getElementById('modal-error');
   var saveBtn = document.getElementById('save-btn');
 
@@ -1485,7 +1416,7 @@ async function saveStream() {
   saveBtn.textContent = 'Saving...';
   errEl.style.display = 'none';
 
-  var payload = { name: name, streamKey: key, resolution: res, audioVolume: audioVol, audioMuted: audioMuted };
+  var payload = { name: name, streamKey: key, resolution: res };
 
   try {
     if (editingStreamId) {
@@ -1742,8 +1673,8 @@ app.post('/api/streams', requireAuthApi, async (req, res) => {
     const count = parseInt((await pool.query('SELECT COUNT(*) FROM streams WHERE user_id=$1', [req.session.userId])).rows[0].count);
     if (count >= user.stream_slots) return res.status(400).json({ error: 'Stream slot limit reached. Upgrade your plan.' });
     const result = await pool.query(
-      'INSERT INTO streams (user_id,name,stream_key,resolution,video_volume,video_muted,audio_volume,audio_muted) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-      [req.session.userId, name||'My Stream', streamKey||null, resolution||'1080p', videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false]
+      'INSERT INTO streams (user_id,name,stream_key,resolution) VALUES ($1,$2,$3,$4) RETURNING *',
+      [req.session.userId, name||'My Stream', streamKey||null, resolution||'1080p']
     );
     res.json(result.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1751,12 +1682,12 @@ app.post('/api/streams', requireAuthApi, async (req, res) => {
 
 app.put('/api/streams/:id', requireAuthApi, async (req, res) => {
   try {
-    const { name, streamKey, resolution, videoVolume, videoMuted, audioVolume, audioMuted } = req.body;
+    const { name, streamKey, resolution } = req.body;
     const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
     if (!stream) return res.status(404).json({ error: 'Stream not found' });
     await pool.query(
-      'UPDATE streams SET name=$1,stream_key=$2,resolution=$3,video_volume=$4,video_muted=$5,audio_volume=$6,audio_muted=$7 WHERE id=$8',
-      [name, streamKey||null, resolution, videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false, req.params.id]
+      'UPDATE streams SET name=$1,stream_key=$2,resolution=$3 WHERE id=$4',
+      [name, streamKey||null, resolution, req.params.id]
     );
     const active = activeStreams.get(parseInt(req.params.id));
     if (active) {
