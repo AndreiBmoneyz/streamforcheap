@@ -1078,7 +1078,7 @@ a{text-decoration:none;color:inherit;}
       <label>Audio volume</label>
       <input type="range" id="audio-vol" min="0" max="100" value="100" oninput="onVolChange('audio')"/>
       <span class="vol-val" id="audio-vol-val">100%</span>
-      <button class="mute-btn" id="audio-mute-btn" onclick="toggleMute('audio')">Mute</button>
+      <button class="mute-btn" id="audio-mute-btn" onclick="toggleMute()">Mute</button>
     </div>
     <div class="progress-wrap" id="upload-progress">
       <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
@@ -1170,7 +1170,6 @@ var savedTracks = [];
 var removedSavedIndices = [];
 var newAudioFiles = [];
 var newAudioDurations = [];
-var videoMuted = false;
 var audioMuted = false;
 var volDebounce = null;
 var pendingRemoveIndex = null;
@@ -1428,18 +1427,11 @@ function onVolChange(type) {
   }
 }
 
-function toggleMute(type) {
-  if (type === 'video') {
-    videoMuted = !videoMuted;
-    document.getElementById('video-mute-btn').className = 'mute-btn' + (videoMuted ? ' muted' : '');
-    document.getElementById('video-vol').value = videoMuted ? 0 : 100;
-    document.getElementById('video-vol-val').textContent = videoMuted ? '0%' : '100%';
-  } else {
-    audioMuted = !audioMuted;
-    document.getElementById('audio-mute-btn').className = 'mute-btn' + (audioMuted ? ' muted' : '');
-    document.getElementById('audio-vol').value = audioMuted ? 0 : 100;
-    document.getElementById('audio-vol-val').textContent = audioMuted ? '0%' : '100%';
-  }
+function toggleMute() {
+  audioMuted = !audioMuted;
+  document.getElementById('audio-mute-btn').className = 'mute-btn' + (audioMuted ? ' muted' : '');
+  document.getElementById('audio-vol').value = audioMuted ? 0 : 100;
+  document.getElementById('audio-vol-val').textContent = audioMuted ? '0%' : '100%';
   if (editingStreamId && liveMap[editingStreamId]) {
     clearTimeout(volDebounce);
     volDebounce = setTimeout(async function() {
@@ -1458,8 +1450,6 @@ async function saveMetaNow() {
       name: document.getElementById('stream-name').value.trim(),
       streamKey: document.getElementById('stream-key').value.trim(),
       resolution: document.getElementById('stream-res').value,
-      videoVolume: parseInt(document.getElementById('video-vol').value),
-      videoMuted: videoMuted,
       audioVolume: parseInt(document.getElementById('audio-vol').value),
       audioMuted: audioMuted
     })
@@ -1470,7 +1460,6 @@ async function saveStream() {
   var name = document.getElementById('stream-name').value.trim();
   var key = document.getElementById('stream-key').value.trim();
   var res = document.getElementById('stream-res').value;
-  var videoVol = parseInt(document.getElementById('video-vol').value);
   var audioVol = parseInt(document.getElementById('audio-vol').value);
   var errEl = document.getElementById('modal-error');
   var saveBtn = document.getElementById('save-btn');
@@ -1481,7 +1470,7 @@ async function saveStream() {
   saveBtn.textContent = 'Saving...';
   errEl.style.display = 'none';
 
-  var payload = { name: name, streamKey: key, resolution: res, videoVolume: videoVol, videoMuted: videoMuted, audioVolume: audioVol, audioMuted: audioMuted };
+  var payload = { name: name, streamKey: key, resolution: res, audioVolume: audioVol, audioMuted: audioMuted };
 
   try {
     if (editingStreamId) {
