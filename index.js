@@ -9,7 +9,6 @@ const path = require('path');
 const Stripe = require('stripe');
 
 const app = express();
-app.set('trust proxy', 1);
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -136,7 +135,7 @@ function buildFFmpegArgs(stream) {
     ? stream.audio_tracks.filter(t => t.path && fs.existsSync(t.path))
     : [];
   const hasAudioTracks = tracks.length > 0;
-  const videoVol = 0;
+  const videoVol = stream.video_muted ? 0 : (stream.video_volume || 100) / 100;
   const audioVol = stream.audio_muted ? 0 : (stream.audio_volume || 100) / 100;
   const vf = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p`;
   const rtmp = `rtmp://a.rtmp.youtube.com/live2/${stream.stream_key}`;
@@ -1025,11 +1024,11 @@ a{text-decoration:none;color:inherit;}
     <div class="add-audio-row">
       <button class="add-audio-btn" id="add-audio-btn">+ Add audio track</button>
     </div>
-    <div class="volume-row" style="opacity:0.4;pointer-events:none;">
-      <label>Video volume</label>
-      <input type="range" id="video-vol" min="0" max="100" value="0"/>
-      <span class="vol-val" id="video-vol-val">0%</span>
-      <button class="mute-btn muted" id="video-mute-btn">Muted</button>
+    <div class="volume-row" style="margin-top:12px;">
+      <label>Audio volume</label>
+      <input type="range" id="audio-vol" min="0" max="100" value="100" oninput="onVolChange('audio')"/>
+      <span class="vol-val" id="audio-vol-val">100%</span>
+      <button class="mute-btn" id="audio-mute-btn" onclick="toggleMute('audio')">Mute</button>
     </div>
     <div class="progress-wrap" id="upload-progress">
       <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
@@ -1184,24 +1183,24 @@ function openModal() {
   newAudioFiles = [];
   newAudioDurations = [];
   videoMuted = false;
-audioMuted = false;
-    document.getElementById('modal-title').textContent = 'Add stream';
-    document.getElementById('stream-name').value = '';
-    document.getElementById('stream-key').value = '';
-    document.getElementById('stream-res').value = isStarterPlan ? '720p' : '1080p';
-    if(document.getElementById('video-vol')) document.getElementById('video-vol').value = 0;
-    if(document.getElementById('video-vol-val')) document.getElementById('video-vol-val').textContent = '0%';
-    document.getElementById('audio-vol').value = 100;
-    document.getElementById('audio-vol-val').textContent = '100%';
-    document.getElementById('video-mute-btn').className = 'mute-btn muted';
-    document.getElementById('audio-mute-btn').className = 'mute-btn';
-    document.getElementById('modal-error').style.display = 'none';
-    document.getElementById('upload-progress').style.display = 'none';
-    document.getElementById('save-btn').disabled = false;
-    document.getElementById('save-btn').textContent = 'Save stream';
-    document.getElementById('save-note').textContent = '';
-    setPreviewEmpty();
-    renderAudioTracks();
+  audioMuted = false;
+  document.getElementById('modal-title').textContent = 'Add stream';
+  document.getElementById('stream-name').value = '';
+  document.getElementById('stream-key').value = '';
+  document.getElementById('stream-res').value = isStarterPlan ? '720p' : '1080p';
+  document.getElementById('video-vol').value = 100;
+  document.getElementById('video-vol-val').textContent = '100%';
+  document.getElementById('audio-vol').value = 100;
+  document.getElementById('audio-vol-val').textContent = '100%';
+  document.getElementById('video-mute-btn').className = 'mute-btn';
+  document.getElementById('audio-mute-btn').className = 'mute-btn';
+  document.getElementById('modal-error').style.display = 'none';
+  document.getElementById('upload-progress').style.display = 'none';
+  document.getElementById('save-btn').disabled = false;
+  document.getElementById('save-btn').textContent = 'Save stream';
+  document.getElementById('save-note').textContent = '';
+  setPreviewEmpty();
+  renderAudioTracks();
   document.getElementById('stream-modal').classList.add('open');
 }
 
@@ -1221,11 +1220,11 @@ function editStream(id) {
   document.getElementById('stream-name').value = s.name || '';
   document.getElementById('stream-key').value = s.stream_key || '';
   document.getElementById('stream-res').value = isStarterPlan ? '720p' : (s.resolution || '1080p');
-  if(document.getElementById('video-vol')) document.getElementById('video-vol').value = 0;
-  if(document.getElementById('video-vol-val')) document.getElementById('video-vol-val').textContent = '0%';
+  document.getElementById('video-vol').value = s.video_volume || 100;
+  document.getElementById('video-vol-val').textContent = (s.video_volume || 100) + '%';
   document.getElementById('audio-vol').value = s.audio_volume || 100;
   document.getElementById('audio-vol-val').textContent = (s.audio_volume || 100) + '%';
-  document.getElementById('video-mute-btn').className = 'mute-btn muted';
+  document.getElementById('video-mute-btn').className = 'mute-btn' + (videoMuted ? ' muted' : '');
   document.getElementById('audio-mute-btn').className = 'mute-btn' + (audioMuted ? ' muted' : '');
   document.getElementById('modal-error').style.display = 'none';
   document.getElementById('upload-progress').style.display = 'none';
