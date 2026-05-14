@@ -288,17 +288,6 @@ function buildFFmpegArgs(stream) {
   return args;
 }
 
-  args.push(
-  '-c:a', 'copy',
-  '-f', 'flv',
-  '-flvflags', 'no_duration_filesize',
-  '-rtmp_buffer', '0',
-  '-rtmp_live', 'live',
-  rtmp
-);
-
-  return args;
-}
 
 function startFFmpeg(streamId, streamData) {
   if (!streamData.encoded_path || !fs.existsSync(streamData.encoded_path)) return;
