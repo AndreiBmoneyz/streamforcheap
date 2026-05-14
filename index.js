@@ -84,6 +84,7 @@ pool.query(`
   ALTER TABLE streams ADD COLUMN IF NOT EXISTS encoded_path TEXT;
   ALTER TABLE streams ADD COLUMN IF NOT EXISTS encode_status TEXT NOT NULL DEFAULT 'none';
   ALTER TABLE streams ADD COLUMN IF NOT EXISTS encode_progress INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE streams ADD COLUMN IF NOT EXISTS premix_path TEXT;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'inactive';
@@ -124,6 +125,26 @@ async function generateThumb(filePath, streamId) {
       else resolve(null);
     });
   });
+}
+
+async function premixAudio(streamId, tracks) {
+  const validTracks = tracks.filter(t => t.path && fs.existsSync(t.path));
+  if (validTracks.length === 0) return;
+  const premixFile = path.join(ENCODED_DIR, 'premix_' + streamId + '_' + Date.now() + '.aac');
+  await new Promise((resolve, reject) => {
+    let args = [];
+    for (const t of validTracks) args.push('-i', t.path);
+    if (validTracks.length === 1) {
+      args.push('-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2', '-y', premixFile);
+    } else {
+      args.push('-filter_complex', `concat=n=${validTracks.length}:v=0:a=1[aout]`, '-map', '[aout]', '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2', '-y', premixFile);
+    }
+    const proc = spawn('ffmpeg', args);
+    proc.on('close', code => code === 0 ? resolve() : reject(new Error('Premix failed')));
+  });
+  const old = (await pool.query('SELECT premix_path FROM streams WHERE id=$1', [streamId])).rows[0]?.premix_path;
+  if (old && fs.existsSync(old)) try { fs.unlinkSync(old); } catch(e) {}
+  await pool.query('UPDATE streams SET premix_path=$1 WHERE id=$2', [premixFile, streamId]);
 }
 
 async function preEncodeFile(streamId, filePath, resolution) {
@@ -239,10 +260,6 @@ async function preEncodeFile(streamId, filePath, resolution) {
 //   6. -flvflags no_duration_filesize kept — required for live FLV streams.
 
 function buildFFmpegArgs(stream) {
-  const tracks = Array.isArray(stream.audio_tracks)
-    ? stream.audio_tracks.filter(t => t.path && fs.existsSync(t.path))
-    : [];
-  const hasAudioTracks = tracks.length > 0;
   const audioVol = stream.audio_muted ? 0 : (stream.audio_volume || 100) / 100;
   const rtmp = `rtmp://a.rtmp.youtube.com/live2/${stream.stream_key}`;
   const args = [];
@@ -250,25 +267,18 @@ function buildFFmpegArgs(stream) {
   // Video input — pre-encoded, just copy bytes
   args.push('-thread_queue_size', '4096', '-re', '-stream_loop', '-1', '-i', stream.encoded_path);
 
-  // Audio track inputs
-  for (const t of tracks) {
-    args.push('-thread_queue_size', '4096', '-stream_loop', '-1', '-i', t.path);
-  }
-
   // Video: copy, no re-encoding
   args.push('-c:v', 'copy');
 
-  // Audio mixing
-  if (hasAudioTracks) {
-    let fc = '';
-    const trackCount = tracks.length;
-    for (let i = 0; i < trackCount; i++) {
-      fc += `[${i+1}:a]volume=${audioVol}[at${i}];`;
+  // Audio — use premixed file if available, otherwise silence
+  const hasPremix = stream.premix_path && fs.existsSync(stream.premix_path);
+  if (hasPremix) {
+    args.push('-thread_queue_size', '4096', '-stream_loop', '-1', '-i', stream.premix_path);
+    if (audioVol !== 1) {
+      args.push('-filter_complex', `[1:a]volume=${audioVol}[aout]`, '-map', '0:v', '-map', '[aout]');
+    } else {
+      args.push('-map', '0:v', '-map', '1:a');
     }
-    const concatIns = tracks.map((_,i) => `[at${i}]`).join('');
-    fc += `${concatIns}concat=n=${trackCount}:v=0:a=1[aconcat];`;
-    fc += `[aconcat]aloop=loop=-1:size=0[aout]`;
-    args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
   } else {
     args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-map', '0:v', '-map', '1:a');
   }
@@ -1818,8 +1828,7 @@ app.post('/api/streams/:id/upload-audio', requireAuthApi, upload.single('file'),
     const tracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks : [];
     tracks.push({ path: req.file.path, name: req.file.originalname });
     await pool.query('UPDATE streams SET audio_tracks=$1 WHERE id=$2', [JSON.stringify(tracks), req.params.id]);
-    const active = activeStreams.get(parseInt(req.params.id));
-    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
+    premixAudio(parseInt(req.params.id), tracks).catch(console.error);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
