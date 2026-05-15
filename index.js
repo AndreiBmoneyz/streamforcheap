@@ -91,6 +91,10 @@ pool.query(`
   ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
 `).catch(console.error);
 
+pool.query(`
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS cancel_at BIGINT;
+`).catch(console.error);
+
 const PLANS = {
   starter: { name: 'Starter', price: 2,  slots: 1, priceId: process.env.STRIPE_PRICE_STARTER || '' },
   pro:     { name: 'Pro',     price: 5,  slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '' },
@@ -1100,6 +1104,37 @@ a{text-decoration:none;color:inherit;}
 <div class="main">
   ${welcome?`<div class="welcome-banner">🎉 Welcome, ${displayName}! Your subscription is active. Add your first stream below to get started.</div>`:''}
   <div class="demo-banner">🧪 Demo mode active — Studio tier unlocked for free. Remove before launch.</div>
+  <div class="billing-section" style="background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:1.5rem;margin-bottom:1.5rem;">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+    <div>
+      <div style="font-size:12px;color:#555;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Current Plan</div>
+      <div style="font-size:20px;font-weight:800;color:#fff;">${user.plan.charAt(0).toUpperCase()+user.plan.slice(1)} <span style="font-size:14px;font-weight:400;color:#888;">— $${PLANS[user.plan]?.price || 0}/month</span></div>
+      ${user.subscription_status === 'cancelling' && user.cancel_at ? 
+        `<div style="font-size:13px;color:#f87171;margin-top:4px;">⚠ Cancels on ${new Date(user.cancel_at * 1000).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'})} — access ends then</div>` :
+        `<div style="font-size:13px;color:#555;margin-top:4px;">Renews automatically · cancel anytime</div>`
+      }
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;">
+      <a href="/#pricing" style="font-size:13px;font-weight:700;color:#aaff00;background:rgba(170,255,0,0.1);border:1px solid rgba(170,255,0,0.2);border-radius:8px;padding:8px 16px;text-decoration:none;">Upgrade plan</a>
+      ${user.subscription_status !== 'cancelling' && user.plan !== 'free' && user.plan !== 'demo' ?
+        `<button onclick="document.getElementById('cancel-confirm').style.display='flex'" style="font-size:13px;font-weight:600;color:#888;background:transparent;border:1px solid #333;border-radius:8px;padding:8px 16px;cursor:pointer;">Cancel subscription</button>` :
+        ''
+      }
+    </div>
+  </div>
+</div>
+
+<div id="cancel-confirm" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:300;align-items:center;justify-content:center;padding:1rem;">
+  <div style="background:#111;border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:2rem;max-width:380px;width:100%;text-align:center;">
+    <div style="font-size:28px;margin-bottom:12px;">😢</div>
+    <h3 style="font-size:18px;font-weight:700;margin-bottom:8px;">Cancel subscription?</h3>
+    <p style="font-size:14px;color:#888;margin-bottom:1.5rem;line-height:1.6;">Your streams will keep running until the end of your billing period. After that your account will be downgraded to free.</p>
+    <div style="display:flex;gap:10px;">
+      <button onclick="document.getElementById('cancel-confirm').style.display='none'" style="flex:1;padding:11px;background:#1a1a1a;color:#aaa;border:1px solid #333;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">Keep subscription</button>
+      <button onclick="cancelSub()" id="cancel-yes-btn" style="flex:1;padding:11px;background:rgba(248,113,113,0.15);color:#f87171;border:1px solid rgba(248,113,113,0.3);border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;">Yes, cancel</button>
+    </div>
+  </div>
+</div>
   <div class="page-title">Your Streams</div>
   <div class="page-sub">${user.email} · ${user.plan} plan</div>
 
@@ -1546,6 +1581,18 @@ async function startStream(id) {
   setTimeout(pollEncoding, 2000);
 })();
 
+async function cancelSub() {
+  const btn = document.getElementById('cancel-yes-btn');
+  btn.textContent = 'Cancelling...';
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/cancel-subscription', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { alert(data.error); btn.textContent = 'Yes, cancel'; btn.disabled = false; return; }
+    location.reload();
+  } catch(e) { alert('Something went wrong.'); btn.textContent = 'Yes, cancel'; btn.disabled = false; }
+}
+
 async function stopStream(id) {
   await fetch('/api/streams/' + id + '/stop', { method: 'POST' });
   location.reload();
@@ -1810,6 +1857,18 @@ app.delete('/api/streams/:id', requireAuthApi, async (req, res) => {
     for (const t of tracks) { if (t.path && fs.existsSync(t.path)) { try { fs.unlinkSync(t.path); } catch(e) {} } }
     await pool.query('DELETE FROM streams WHERE id=$1', [req.params.id]);
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/cancel-subscription', requireAuthApi, async (req, res) => {
+  try {
+    const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
+    if (!user.stripe_subscription_id) return res.status(400).json({ error: 'No active subscription found' });
+    const subscription = await stripe.subscriptions.update(user.stripe_subscription_id, {
+      cancel_at_period_end: true
+    });
+    await pool.query('UPDATE users SET subscription_status=$1, cancel_at=$2 WHERE id=$3', ['cancelling', subscription.current_period_end, user.id]);
+    res.json({ success: true, cancel_at: subscription.current_period_end });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
