@@ -844,10 +844,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <input type="text" id="cardholder-name" placeholder="Name on card"/>
 </div>
 <div class="field">
-  <label>Card details</label>
-      <div id="card-element"></div>
-      <div id="card-errors"></div>
-    </div>
+  <label>Card number</label>
+  <div id="card-number" style="background:#1a1a1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:14px;"></div>
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+  <div class="field">
+    <label>Expiry date</label>
+    <div id="card-expiry" style="background:#1a1a1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:14px;"></div>
+  </div>
+  <div class="field">
+    <label>CVC</label>
+    <div id="card-cvc" style="background:#1a1a1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:14px;"></div>
+  </div>
+  <div class="field">
+    <label>Postal code</label>
+    <input type="text" id="postal-code" placeholder="12345" style="padding:12px 14px;"/>
+  </div>
+</div>
+<div id="card-errors" style="color:#f87171;font-size:13px;margin-top:8px;display:none;"></div>
     <button class="pay-btn" id="pay-btn" onclick="handlePayment()">Subscribe — $${(planData.price + 0.29).toFixed(2)}/month</button>
     <div class="secure-note"><span class="lock">🔒</span> Secured by Stripe &nbsp;·&nbsp; Cancel anytime</div>
   </div>
@@ -855,14 +869,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <script>
 const stripe = Stripe('${process.env.STRIPE_PUBLISHABLE_KEY}');
 const elements = stripe.elements();
-const card = elements.create('card', {
-  style: {
-    base: { color: '#fff', fontFamily: '-apple-system, sans-serif', fontSize: '15px', '::placeholder': { color: '#555' } },
-    invalid: { color: '#f87171' }
-  },
-  hidePostalCode: false
+const cardNumber = elements.create('cardNumber', {
+  style: { base: { color: '#fff', fontFamily: '-apple-system, sans-serif', fontSize: '15px', '::placeholder': { color: '#555' } }, invalid: { color: '#f87171' } }
 });
-card.mount('#card-element');
+const cardExpiry = elements.create('cardExpiry', {
+  style: { base: { color: '#fff', fontFamily: '-apple-system, sans-serif', fontSize: '15px', '::placeholder': { color: '#555' } }, invalid: { color: '#f87171' } }
+});
+const cardCvc = elements.create('cardCvc', {
+  style: { base: { color: '#fff', fontFamily: '-apple-system, sans-serif', fontSize: '15px', '::placeholder': { color: '#555' } }, invalid: { color: '#f87171' } }
+});
+cardNumber.mount('#card-number');
+cardExpiry.mount('#card-expiry');
+cardCvc.mount('#card-cvc');
+cardNumber.on('change', e => { const err = document.getElementById('card-errors'); if(e.error){err.textContent=e.error.message;err.style.display='block';}else{err.style.display='none';} });
 card.on('change', e => {
   const err = document.getElementById('card-errors');
   if(e.error){err.textContent=e.error.message;err.style.display='block';}
@@ -881,12 +900,14 @@ async function handlePayment(){
     if(intentData.error){ throw new Error(intentData.error); }
     const name = document.getElementById('cardholder-name').value.trim();
     if (!name) { throw new Error('Please enter the name on your card'); }
+    const postalCode = document.getElementById('postal-code').value.trim();
     const result = await stripe.confirmCardPayment(intentData.clientSecret, {
       payment_method: { 
-        card,
+        card: cardNumber,
         billing_details: {
           name: name,
-          email: '${user.email}'
+          email: '${user.email}',
+          address: { postal_code: postalCode }
         }
       }
     });
