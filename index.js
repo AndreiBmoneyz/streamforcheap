@@ -908,7 +908,7 @@ async function handlePayment(){
 app.get('/dashboard', requireAuth, async (req, res) => {
   const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
   const streams = (await pool.query('SELECT * FROM streams WHERE user_id=$1 ORDER BY created_at DESC', [req.session.userId])).rows;
-  const planSlots = { starter:1, pro:1, creator:3, studio:6, demo:6 };
+  const planSlots = { starter:1, pro:1, creator:3, studio:6, demo:200 };
   const maxSlots = planSlots[user.plan] || 0;
   const liveMap = {};
   streams.forEach(s => { liveMap[s.id] = activeStreams.has(s.id); });
