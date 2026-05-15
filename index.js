@@ -1840,7 +1840,7 @@ app.post('/api/streams/:id/upload-video', requireAuthApi, upload.single('file'),
     if (stream.thumb_path) { const tp = path.join(THUMB_DIR, path.basename(stream.thumb_path)); if (fs.existsSync(tp)) { try { fs.unlinkSync(tp); } catch(e) {} } }
     const thumbPath = await generateThumb(req.file.path, req.params.id);
     await pool.query('UPDATE streams SET file_path=$1,file_name=$2,thumb_path=$3,encoded_path=NULL,encode_status=$4,encode_progress=$5 WHERE id=$6',
-      [req.file.path, req.file.originalname, thumbPath, 'none', 0, req.params.id]);
+      [req.file.path, req.file.originalname, thumbPath, 'encoding', 0, req.params.id]);
     res.json({ success: true, thumb_path: thumbPath });
     const updatedStream = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0];
     preEncodeFile(parseInt(req.params.id), req.file.path, updatedStream.resolution)
