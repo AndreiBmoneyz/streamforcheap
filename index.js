@@ -1206,7 +1206,18 @@ a{text-decoration:none;color:inherit;}
           </div>
         </div>
         <div class="stream-actions">
-          ${!isLive?`<button class="btn-start" onclick="startStream(${s.id})" ${!s.file_path||!s.stream_key?'disabled':''}>${!s.file_path||!s.stream_key?'⚠ Missing file or key':'▶ Start stream'}</button>`:''}
+          ${!isLive?`
+  ${s.file_path && s.encode_status === 'encoding' ? 
+    `<button class="btn-start" disabled style="opacity:0.5;cursor:not-allowed;">⚙️ Encoding...</button>
+    <div style="font-size:12px;color:#888;margin-top:6px;">Your video is encoding for better streaming, this might take a few minutes. Please wait.</div>` :
+    s.file_path && s.encode_status === 'ready' && s.stream_key ?
+    `<button class="btn-start" onclick="startStream(${s.id})">▶ Start stream</button>` :
+    s.file_path && s.encode_status === 'none' ?
+    `<button class="btn-start" disabled style="opacity:0.5;">⚙️ Preparing...</button>
+    <div style="font-size:12px;color:#888;margin-top:6px;">Your video is encoding for better streaming, this might take a few minutes. Please wait.</div>` :
+    `<button class="btn-start" disabled ${!s.file_path||!s.stream_key?'':''}>${!s.file_path?'⚠ Upload a file':!s.stream_key?'⚠ Set stream key':'⚠ Not ready'}</button>`
+  }
+`:''}
           ${isLive?`<button class="btn-stop" onclick="stopStream(${s.id})">⬛ Stop stream</button>`:''}
           <button class="btn-edit" onclick="editStream(${s.id})">✏️ Edit</button>
           <button class="btn-delete" onclick="deleteStream(${s.id})">🗑 Delete</button>
