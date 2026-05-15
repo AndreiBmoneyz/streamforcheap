@@ -831,11 +831,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <div class="payment-form">
     <h2>Payment Details</h2>
     <div class="field">
-      <label>Email</label>
-      <input type="text" value="${user.email}" disabled style="opacity:0.6;"/>
-    </div>
-    <div class="field">
-      <label>Card details</label>
+  <label>Email</label>
+  <input type="text" value="${user.email}" disabled style="opacity:0.6;"/>
+</div>
+<div class="field">
+  <label>Full name</label>
+  <input type="text" id="cardholder-name" placeholder="Name on card"/>
+</div>
+<div class="field">
+  <label>Card details</label>
       <div id="card-element"></div>
       <div id="card-errors"></div>
     </div>
@@ -850,7 +854,8 @@ const card = elements.create('card', {
   style: {
     base: { color: '#fff', fontFamily: '-apple-system, sans-serif', fontSize: '15px', '::placeholder': { color: '#555' } },
     invalid: { color: '#f87171' }
-  }
+  },
+  hidePostalCode: false
 });
 card.mount('#card-element');
 card.on('change', e => {
@@ -869,8 +874,16 @@ async function handlePayment(){
     });
     const intentData = await intentRes.json();
     if(intentData.error){ throw new Error(intentData.error); }
+    const name = document.getElementById('cardholder-name').value.trim();
+    if (!name) { throw new Error('Please enter the name on your card'); }
     const result = await stripe.confirmCardPayment(intentData.clientSecret, {
-      payment_method: { card }
+      payment_method: { 
+        card,
+        billing_details: {
+          name: name,
+          email: '${user.email}'
+        }
+      }
     });
     if(result.error){ throw new Error(result.error.message); }
     window.location.href = '/dashboard?welcome=1';
