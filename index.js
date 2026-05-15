@@ -656,7 +656,7 @@ async function register(){
     const res=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,email,password:pw,plan:'${plan}'})});
     const data=await res.json();
     if(data.error){err.textContent=data.error;err.style.display='block';btn.disabled=false;btn.textContent='Continue to payment →';return;}
-    if('${plan}' && '${plan}' !== 'undefined'){
+    if('${plan}' && '${plan}' !== 'undefined' && '${plan}' !== ''){
   window.location.href='/checkout?plan=${plan}';
 } else {
   window.location.href='/dashboard';
