@@ -596,7 +596,7 @@ app.get('/api/me', (req, res) => {
 });
 
 app.get('/register', (req, res) => {
-  const plan = req.query.plan || 'pro';
+  const plan = req.query.plan || '';
   if (req.session.userId) return res.redirect('/checkout?plan=' + plan);
   res.send(`<!DOCTYPE html>
 <html lang="en">
