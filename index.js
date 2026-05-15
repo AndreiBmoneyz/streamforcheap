@@ -656,7 +656,11 @@ async function register(){
     const res=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,email,password:pw,plan:'${plan}'})});
     const data=await res.json();
     if(data.error){err.textContent=data.error;err.style.display='block';btn.disabled=false;btn.textContent='Continue to payment →';return;}
-    window.location.href='/checkout?plan=${plan}';
+    if('${plan}' && '${plan}' !== 'undefined'){
+  window.location.href='/checkout?plan=${plan}';
+} else {
+  window.location.href='/dashboard';
+}
   }catch(e){err.textContent='Something went wrong.';err.style.display='block';btn.disabled=false;btn.textContent='Continue to payment →';}
 }
 document.addEventListener('keydown',e=>{if(e.key==='Enter')register();});
@@ -699,6 +703,7 @@ h1{font-size:24px;font-weight:800;margin-bottom:8px;}.sub{color:#666;font-size:1
   <div class="field"><label>Password</label><input type="password" id="password" placeholder="Your password"/></div>
   <button class="btn" id="btn" onclick="login()">Log in</button>
   <div class="link">Don't have an account? <a href="/register${plan?'?plan='+plan:''}">Sign up</a></div>
+<div class="link" style="margin-top:8px;"><a href="/forgot-password">Forgot password?</a></div>
 </div>
 <script>
 const redirectPlan='${plan}';
@@ -740,7 +745,7 @@ app.get('/demo-activate', requireAuth, async (req, res) => {
 // ==================== CHECKOUT ====================
 
 app.get('/checkout', requireAuth, async (req, res) => {
-  const plan = req.query.plan || 'pro';
+  const plan = req.query.plan || '';
   const planData = PLANS[plan];
   if (!planData) return res.redirect('/');
   const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
@@ -1673,7 +1678,7 @@ app.post('/api/register', async (req, res) => {
       [email.toLowerCase().trim(), hashed, username||null, 'free', 0]
     );
     req.session.userId = result.rows[0].id;
-    res.json({ success: true });
+    res.json({ success: true, plan: req.body.plan || '' });
   } catch (e) { console.error('Register error:', e); res.status(500).json({ error: 'Registration failed. Please try again.' }); }
 });
 
