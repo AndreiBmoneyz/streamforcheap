@@ -626,17 +626,17 @@ h1{font-size:24px;font-weight:800;margin-bottom:8px;}.sub{color:#666;font-size:1
 <div class="card">
   <div class="logo"><a href="/" style="text-decoration:none;color:inherit;">stream<span class="g">forcheap</span></a></div>
   <h1>Create account</h1>
-  <p class="sub">You're signing up for the ${plan.charAt(0).toUpperCase()+plan.slice(1)} plan</p>
-  <div class="plan-banner">
+  <p class="sub">${plan ? `You're signing up for the ${plan.charAt(0).toUpperCase()+plan.slice(1)} plan` : 'Create your free account'}</p>
+  ${plan ? `<div class="plan-banner">
     <span class="pname">${plan.charAt(0).toUpperCase()+plan.slice(1)} Plan</span>
     <span class="pprice">$${PLANS[plan]?.price || 5}/month · cancel anytime</span>
-  </div>
+  </div>` : ''}
   <div class="error" id="error"></div>
   <div class="field"><label>Your name</label><input type="text" id="username" placeholder="e.g. Alex"/></div>
   <div class="field"><label>Email address</label><input type="email" id="email" placeholder="you@example.com"/></div>
   <div class="field"><label>Password</label><input type="password" id="password" placeholder="Min 8 characters"/></div>
   <div class="field"><label>Confirm password</label><input type="password" id="password2" placeholder="Repeat password"/></div>
-  <button class="btn" id="btn" onclick="register()">Continue to payment →</button>
+  <button class="btn" id="btn" onclick="register()">${plan ? 'Continue to payment →' : 'Create account'}</button>
   <div class="link">Already have an account? <a href="/login?plan=${plan}">Log in</a></div>
 </div>
 <script>
