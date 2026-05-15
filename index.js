@@ -713,7 +713,7 @@ app.get('/demo-activate', requireAuth, async (req, res) => {
   try {
     await pool.query(
       'UPDATE users SET plan=$1, stream_slots=$2, subscription_status=$3 WHERE id=$4',
-      ['demo', 6, 'active', req.session.userId]
+      ['demo', 200, 'active', req.session.userId]
     );
     res.redirect('/dashboard?welcome=1');
   } catch (e) {
