@@ -96,11 +96,11 @@ pool.query(`
 `).catch(console.error);
 
 const PLANS = {
-  starter: { name: 'Starter', price: 2,  slots: 1, priceId: process.env.STRIPE_PRICE_STARTER || '' },
-  pro:     { name: 'Pro',     price: 5,  slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '' },
-  creator: { name: 'Creator', price: 12, slots: 3, priceId: process.env.STRIPE_PRICE_CREATOR || '' },
-  studio:  { name: 'Studio',  price: 20, slots: 6, priceId: process.env.STRIPE_PRICE_STUDIO || '' },
-  demo:    { name: 'Demo',    price: 0,  slots: 6, priceId: '' }, // REMOVE BEFORE LAUNCH
+  starter: { name: 'Starter', price: 2.30,  slots: 1, priceId: process.env.STRIPE_PRICE_STARTER || '' },
+  pro:     { name: 'Pro',     price: 5.30,  slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '' },
+  creator: { name: 'Creator', price: 12.30, slots: 3, priceId: process.env.STRIPE_PRICE_CREATOR || '' },
+  studio:  { name: 'Studio',  price: 20.30, slots: 6, priceId: process.env.STRIPE_PRICE_STUDIO || '' },
+  demo:    { name: 'Demo',    price: 0,     slots: 6, priceId: '' },
 };
 
 function requireAuth(req, res, next) {
@@ -814,10 +814,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       <li>Cancel anytime</li>
     </ul>
     <div class="divider"></div>
-    <div class="total-row">
-      <span>Total per month</span>
-      <strong>$${planData.price}/mo</strong>
-    </div>
+    <div class="total-row" style="margin-bottom:8px;">
+  <span>Subtotal</span>
+  <span>$${planData.price}.00</span>
+</div>
+<div class="total-row" style="margin-bottom:16px;">
+  <span style="color:#888;font-size:14px;">Stripe processing fee</span>
+  <span style="color:#888;font-size:14px;">$0.29</span>
+</div>
+<div style="border-top:1px solid rgba(255,255,255,0.08);margin-bottom:16px;"></div>
+<div class="total-row">
+  <span>Total per month</span>
+  <strong>$${(planData.price + 0.29).toFixed(2)}/mo</strong>
+</div>
   </div>
   <div class="payment-form">
     <h2>Payment Details</h2>
@@ -830,7 +839,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       <div id="card-element"></div>
       <div id="card-errors"></div>
     </div>
-    <button class="pay-btn" id="pay-btn" onclick="handlePayment()">Subscribe — $${planData.price}/month</button>
+    <button class="pay-btn" id="pay-btn" onclick="handlePayment()">Subscribe — $${(planData.price + 0.29).toFixed(2)}/month</button>
     <div class="secure-note"><span class="lock">🔒</span> Secured by Stripe &nbsp;·&nbsp; Cancel anytime</div>
   </div>
 </div>
@@ -1663,6 +1672,7 @@ app.post('/api/create-subscription', requireAuthApi, async (req, res) => {
       customer: customerId,
       items: [{ price: planData.priceId }],
       payment_behavior: 'default_incomplete',
+      automatic_tax: { enabled: true },
       expand: ['latest_invoice.payment_intent'],
     });
 
