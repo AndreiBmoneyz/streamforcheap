@@ -11,6 +11,7 @@
     "express-session": "^1.17.3",
     "multer": "^1.4.5-lts.1",
     "bcrypt": "^5.1.0",
-    "stripe": "^14.0.0"
+    "stripe": "^14.0.0",
+    "resend": "^3.0.0"
   }
 }
