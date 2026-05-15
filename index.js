@@ -96,10 +96,10 @@ pool.query(`
 `).catch(console.error);
 
 const PLANS = {
-  starter: { name: 'Starter', price: 2.30,  slots: 1, priceId: process.env.STRIPE_PRICE_STARTER || '' },
-  pro:     { name: 'Pro',     price: 5.30,  slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '' },
-  creator: { name: 'Creator', price: 12.30, slots: 3, priceId: process.env.STRIPE_PRICE_CREATOR || '' },
-  studio:  { name: 'Studio',  price: 20.30, slots: 6, priceId: process.env.STRIPE_PRICE_STUDIO || '' },
+  starter: { name: 'Starter', price: 2,  slots: 1, priceId: process.env.STRIPE_PRICE_STARTER || '' },
+  pro:     { name: 'Pro',     price: 5,  slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '' },
+  creator: { name: 'Creator', price: 12, slots: 3, priceId: process.env.STRIPE_PRICE_CREATOR || '' },
+  studio:  { name: 'Studio',  price: 20, slots: 6, priceId: process.env.STRIPE_PRICE_STUDIO || '' },
   demo:    { name: 'Demo',    price: 0,     slots: 6, priceId: '' },
 };
 
