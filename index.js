@@ -1926,5 +1926,170 @@ app.post('/api/cancel-subscription', requireAuthApi, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.get('/forgot-password', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Forgot Password — StreamForCheap</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:2rem;}
+.card{background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:2.5rem;max-width:420px;width:100%;}
+.logo{font-size:20px;font-weight:800;margin-bottom:2rem;text-align:center;}.logo .g{color:#aaff00;}
+h1{font-size:24px;font-weight:800;margin-bottom:8px;}
+.sub{color:#666;font-size:14px;margin-bottom:2rem;}
+.field{margin-bottom:16px;}.field label{font-size:13px;color:#888;display:block;margin-bottom:6px;}
+.field input{width:100%;padding:12px 14px;background:#1a1a1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;font-size:15px;outline:none;transition:border-color 0.15s;font-family:inherit;}
+.field input:focus{border-color:#aaff00;}
+.btn{width:100%;padding:13px;background:#aaff00;color:#000;font-size:15px;font-weight:700;border-radius:10px;border:none;cursor:pointer;transition:opacity 0.15s;margin-top:8px;}
+.btn:hover{opacity:0.85;}.btn:disabled{opacity:0.5;cursor:not-allowed;}
+.link{text-align:center;font-size:13px;color:#666;margin-top:1.5rem;}.link a{color:#aaff00;}
+.msg{padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px;display:none;}
+.msg.error{background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);color:#f87171;}
+.msg.success{background:rgba(170,255,0,0.08);border:1px solid rgba(170,255,0,0.2);color:#aaff00;}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo"><a href="/" style="text-decoration:none;color:inherit;">stream<span class="g">forcheap</span></a></div>
+  <h1>Forgot password</h1>
+  <p class="sub">Enter your email and we'll send you a reset link.</p>
+  <div class="msg" id="msg"></div>
+  <div class="field"><label>Email address</label><input type="email" id="email" placeholder="you@example.com"/></div>
+  <button class="btn" id="btn" onclick="submit()">Send reset link</button>
+  <div class="link"><a href="/login">← Back to login</a></div>
+</div>
+<script>
+async function submit(){
+  const email=document.getElementById('email').value.trim();
+  const msg=document.getElementById('msg');
+  const btn=document.getElementById('btn');
+  msg.style.display='none';
+  if(!email){msg.textContent='Please enter your email';msg.className='msg error';msg.style.display='block';return;}
+  btn.disabled=true;btn.textContent='Sending...';
+  try{
+    const res=await fetch('/api/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});
+    const data=await res.json();
+    msg.textContent=data.message||data.error;
+    msg.className='msg '+(data.error?'error':'success');
+    msg.style.display='block';
+    if(!data.error){btn.textContent='Email sent!';}
+    else{btn.disabled=false;btn.textContent='Send reset link';}
+  }catch(e){msg.textContent='Something went wrong.';msg.className='msg error';msg.style.display='block';btn.disabled=false;btn.textContent='Send reset link';}
+}
+document.addEventListener('keydown',e=>{if(e.key==='Enter')submit();});
+</script>
+</body>
+</html>`);
+});
+
+app.get('/reset-password', (req, res) => {
+  const token = req.query.token || '';
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Reset Password — StreamForCheap</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:2rem;}
+.card{background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:2.5rem;max-width:420px;width:100%;}
+.logo{font-size:20px;font-weight:800;margin-bottom:2rem;text-align:center;}.logo .g{color:#aaff00;}
+h1{font-size:24px;font-weight:800;margin-bottom:8px;}
+.sub{color:#666;font-size:14px;margin-bottom:2rem;}
+.field{margin-bottom:16px;}.field label{font-size:13px;color:#888;display:block;margin-bottom:6px;}
+.field input{width:100%;padding:12px 14px;background:#1a1a1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;font-size:15px;outline:none;transition:border-color 0.15s;font-family:inherit;}
+.field input:focus{border-color:#aaff00;}
+.btn{width:100%;padding:13px;background:#aaff00;color:#000;font-size:15px;font-weight:700;border-radius:10px;border:none;cursor:pointer;transition:opacity 0.15s;margin-top:8px;}
+.btn:hover{opacity:0.85;}.btn:disabled{opacity:0.5;cursor:not-allowed;}
+.link{text-align:center;font-size:13px;color:#666;margin-top:1.5rem;}.link a{color:#aaff00;}
+.msg{padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px;display:none;}
+.msg.error{background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);color:#f87171;}
+.msg.success{background:rgba(170,255,0,0.08);border:1px solid rgba(170,255,0,0.2);color:#aaff00;}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo"><a href="/" style="text-decoration:none;color:inherit;">stream<span class="g">forcheap</span></a></div>
+  <h1>Reset password</h1>
+  <p class="sub">Enter your new password below.</p>
+  <div class="msg" id="msg"></div>
+  <div class="field"><label>New password</label><input type="password" id="password" placeholder="Min 8 characters"/></div>
+  <div class="field"><label>Confirm password</label><input type="password" id="password2" placeholder="Repeat password"/></div>
+  <button class="btn" id="btn" onclick="submit()">Reset password</button>
+  <div class="link"><a href="/login">← Back to login</a></div>
+</div>
+<script>
+const token='${token}';
+async function submit(){
+  const pw=document.getElementById('password').value;
+  const pw2=document.getElementById('password2').value;
+  const msg=document.getElementById('msg');
+  const btn=document.getElementById('btn');
+  msg.style.display='none';
+  if(!pw||pw.length<8){msg.textContent='Password must be at least 8 characters';msg.className='msg error';msg.style.display='block';return;}
+  if(pw!==pw2){msg.textContent='Passwords do not match';msg.className='msg error';msg.style.display='block';return;}
+  btn.disabled=true;btn.textContent='Resetting...';
+  try{
+    const res=await fetch('/api/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,password:pw})});
+    const data=await res.json();
+    msg.textContent=data.message||data.error;
+    msg.className='msg '+(data.error?'error':'success');
+    msg.style.display='block';
+    if(!data.error){btn.textContent='Password reset!';setTimeout(()=>window.location.href='/login',2000);}
+    else{btn.disabled=false;btn.textContent='Reset password';}
+  }catch(e){msg.textContent='Something went wrong.';msg.className='msg error';msg.style.display='block';btn.disabled=false;btn.textContent='Reset password';}
+}
+document.addEventListener('keydown',e=>{if(e.key==='Enter')submit();});
+</script>
+</body>
+</html>`);
+});
+
+app.post('/api/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const user = (await pool.query('SELECT * FROM users WHERE email=$1', [email.toLowerCase().trim()])).rows[0];
+    if (!user) return res.json({ message: 'If that email exists, a reset link has been sent.' });
+    const token = require('crypto').randomBytes(32).toString('hex');
+    const expires = new Date(Date.now() + 60 * 60 * 1000);
+    await pool.query('DELETE FROM password_resets WHERE user_id=$1', [user.id]);
+    await pool.query('INSERT INTO password_resets (user_id, token, expires_at) VALUES ($1,$2,$3)', [user.id, token, expires]);
+    const resetUrl = `https://streamforcheap.com/reset-password?token=${token}`;
+    await resend.emails.send({
+      from: 'noreply@streamforcheap.com',
+      to: user.email,
+      subject: 'Reset your StreamForCheap password',
+      html: `
+        <div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:2rem;background:#0a0a0a;color:#fff;">
+          <h2 style="color:#aaff00;margin-bottom:1rem;">Reset your password</h2>
+          <p style="color:#aaa;margin-bottom:1.5rem;">Click the button below to reset your password. This link expires in 1 hour.</p>
+          <a href="${resetUrl}" style="background:#aaff00;color:#000;padding:12px 24px;border-radius:8px;font-weight:700;text-decoration:none;display:inline-block;margin-bottom:1.5rem;">Reset password</a>
+          <p style="color:#555;font-size:13px;">If you didn't request this, ignore this email.</p>
+        </div>
+      `
+    });
+    res.json({ message: 'If that email exists, a reset link has been sent.' });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
+});
+
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password) return res.status(400).json({ error: 'Invalid request' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    const reset = (await pool.query('SELECT * FROM password_resets WHERE token=$1 AND expires_at > NOW()', [token])).rows[0];
+    if (!reset) return res.status(400).json({ error: 'Reset link is invalid or has expired.' });
+    const hashed = await bcrypt.hash(password, 10);
+    await pool.query('UPDATE users SET password=$1 WHERE id=$2', [hashed, reset.user_id]);
+    await pool.query('DELETE FROM password_resets WHERE user_id=$1', [reset.user_id]);
+    res.json({ message: 'Password reset successfully! Redirecting to login...' });
+  } catch(e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('StreamForCheap running on port ' + PORT));
