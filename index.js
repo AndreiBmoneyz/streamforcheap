@@ -1210,8 +1210,11 @@ a{text-decoration:none;color:inherit;}
   ${s.file_path && s.encode_status === 'encoding' ? 
     `<button class="btn-start" disabled style="opacity:0.5;cursor:not-allowed;">⚙️ Encoding...</button>
     <div style="font-size:12px;color:#888;margin-top:6px;">Your video is encoding for better streaming, this might take a few minutes. Please wait.</div>` :
-    s.file_path && s.encode_status === 'ready' && s.stream_key ?
+    s.file_path && s.encode_status === 'ready' && s.stream_key && (tracks.length === 0 || s.premix_path) ?
     `<button class="btn-start" onclick="startStream(${s.id})">▶ Start stream</button>` :
+    s.file_path && s.encode_status === 'ready' && s.stream_key && tracks.length > 0 && !s.premix_path ?
+    `<button class="btn-start" disabled style="opacity:0.5;cursor:not-allowed;">⚙️ Mixing audio...</button>
+    <div style="font-size:12px;color:#888;margin-top:6px;">⏳ Your audio is being mixed, please wait a moment.</div>` :
     s.file_path && s.encode_status === 'none' ?
     `<button class="btn-start" disabled style="opacity:0.5;">⚙️ Preparing...</button>
     <div style="font-size:12px;color:#888;margin-top:6px;">Your video is encoding for better streaming, this might take a few minutes. Please wait.</div>` :
@@ -1882,6 +1885,8 @@ app.post('/api/streams/:id/start', requireAuthApi, async (req, res) => {
     const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
     if (!stream) return res.status(404).json({ error: 'Stream not found' });
     if (!stream.encoded_path || !fs.existsSync(stream.encoded_path)) return res.status(400).json({ error: 'Video is still processing. Please wait.' });
+const audioTracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks : [];
+if (audioTracks.length > 0 && (!stream.premix_path || !fs.existsSync(stream.premix_path))) return res.status(400).json({ error: 'Audio is still being mixed. Please wait a moment.' });
     if (!stream.stream_key) return res.status(400).json({ error: 'No stream key set' });
     startFFmpeg(stream.id, stream);
     await pool.query('UPDATE streams SET status=$1 WHERE id=$2', ['live', stream.id]);
