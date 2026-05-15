@@ -151,92 +151,71 @@ async function premixAudio(streamId, tracks) {
   await pool.query('UPDATE streams SET premix_path=$1 WHERE id=$2', [premixFile, streamId]);
 }
 
+let encodingJobs = 0;
+const MAX_CONCURRENT_ENCODES = 1;
+
 async function preEncodeFile(streamId, filePath, resolution) {
-  const ext = path.extname(filePath).toLowerCase();
-  const isImage = ['.jpg','.jpeg','.png','.webp'].includes(ext);
-  const isGif = ext === '.gif';
-  const width = resolution === '1080p' ? 1920 : 1280;
-  const height = resolution === '1080p' ? 1080 : 720;
-  const bitrate = resolution === '1080p' ? '2500k' : '1500k';
-  const bufsize = resolution === '1080p' ? '5000k' : '3000k';
-  const vf = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p`;
-  const encodedFile = path.join(ENCODED_DIR, 'encoded_' + streamId + '_' + Date.now() + '.mp4');
+  while (encodingJobs >= MAX_CONCURRENT_ENCODES) {
+    await new Promise(resolve => setTimeout(resolve, 5000));
+  }
+  encodingJobs++;
+  try {
+    const ext = path.extname(filePath).toLowerCase();
+    const isImage = ['.jpg','.jpeg','.png','.webp'].includes(ext);
+    const isGif = ext === '.gif';
+    const width = resolution === '1080p' ? 1920 : 1280;
+    const height = resolution === '1080p' ? 1080 : 720;
+    const bitrate = resolution === '1080p' ? '2500k' : '1500k';
+    const bufsize = resolution === '1080p' ? '5000k' : '3000k';
+    const vf = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p`;
+    const encodedFile = path.join(ENCODED_DIR, 'encoded_' + streamId + '_' + Date.now() + '.mp4');
 
-  await pool.query('UPDATE streams SET encode_status=$1, encode_progress=$2 WHERE id=$3', ['encoding', 0, streamId]);
+    await pool.query('UPDATE streams SET encode_status=$1, encode_progress=$2 WHERE id=$3', ['encoding', 0, streamId]);
 
-  return new Promise((resolve, reject) => {
-    let args = [];
+    return await new Promise((resolve, reject) => {
+      let args = [];
+      if (isImage) {
+        args = ['-loop', '1', '-framerate', '30', '-i', filePath, '-t', '10', '-c:v', 'libx264', '-preset', 'superfast', '-profile:v', 'high', '-level', '4.2', '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0', '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', bufsize, '-pix_fmt', 'yuv420p', '-vf', vf, '-x264-params', 'nal-hrd=cbr:force-cfr=1', '-an', '-y', encodedFile];
+      } else if (isGif) {
+        args = ['-ignore_loop', '0', '-i', filePath, '-t', '30', '-c:v', 'libx264', '-preset', 'superfast', '-profile:v', 'high', '-level', '4.2', '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0', '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', bufsize, '-pix_fmt', 'yuv420p', '-vf', vf, '-x264-params', 'nal-hrd=cbr:force-cfr=1', '-an', '-y', encodedFile];
+      } else {
+        args = ['-i', filePath, '-c:v', 'libx264', '-preset', 'superfast', '-profile:v', 'high', '-level', '4.2', '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0', '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', bufsize, '-pix_fmt', 'yuv420p', '-vf', vf, '-x264-params', 'nal-hrd=cbr:force-cfr=1', '-an', '-y', encodedFile];
+      }
 
-    if (isImage) {
-      args = [
-        '-loop', '1', '-framerate', '30', '-i', filePath,
-        '-t', '10',
-        '-c:v', 'libx264', '-preset', 'superfast',
-        '-profile:v', 'high', '-level', '4.2',
-        '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
-        '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', bufsize,
-        '-pix_fmt', 'yuv420p', '-vf', vf,
-        '-x264-params', 'nal-hrd=cbr:force-cfr=1',
-        '-an', '-y', encodedFile
-      ];
-    } else if (isGif) {
-      args = [
-        '-ignore_loop', '0', '-i', filePath,
-        '-t', '30',
-        '-c:v', 'libx264', '-preset', 'superfast',
-        '-profile:v', 'high', '-level', '4.2',
-        '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
-        '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', bufsize,
-        '-pix_fmt', 'yuv420p', '-vf', vf,
-        '-x264-params', 'nal-hrd=cbr:force-cfr=1',
-        '-an', '-y', encodedFile
-      ];
-    } else {
-      args = [
-        '-i', filePath,
-        '-c:v', 'libx264', '-preset', 'superfast',
-        '-profile:v', 'high', '-level', '4.2',
-        '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
-        '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', bufsize,
-        '-pix_fmt', 'yuv420p', '-vf', vf,
-        '-x264-params', 'nal-hrd=cbr:force-cfr=1',
-        '-an', '-y', encodedFile
-      ];
-    }
+      let duration = 0;
+      const probe = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', filePath]);
+      let probeOut = '';
+      probe.stdout.on('data', d => probeOut += d.toString());
+      probe.on('close', () => {
+        try {
+          const info = JSON.parse(probeOut);
+          duration = parseFloat(info.format?.duration || 0);
+        } catch(e) {}
 
-    let duration = 0;
-    const probe = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', filePath]);
-    let probeOut = '';
-    probe.stdout.on('data', d => probeOut += d.toString());
-    probe.on('close', () => {
-      try {
-        const info = JSON.parse(probeOut);
-        duration = parseFloat(info.format?.duration || 0);
-      } catch(e) {}
-
-      const proc = spawn('ffmpeg', args);
-      proc.stderr.on('data', (data) => {
-        const msg = data.toString();
-        const timeMatch = msg.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
-        if (timeMatch && duration > 0) {
-          const secs = parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseFloat(timeMatch[3]);
-          const progress = Math.min(99, Math.round((secs / duration) * 100));
-          pool.query('UPDATE streams SET encode_progress=$1 WHERE id=$2', [progress, streamId]).catch(() => {});
-        }
-      });
-      proc.on('close', async (code) => {
-        if (code === 0 && fs.existsSync(encodedFile)) {
-          await pool.query('UPDATE streams SET encoded_path=$1, encode_status=$2, encode_progress=$3 WHERE id=$4',
-            [encodedFile, 'ready', 100, streamId]);
-          resolve(encodedFile);
-        } else {
-          await pool.query('UPDATE streams SET encode_status=$1, encode_progress=$2 WHERE id=$3',
-            ['failed', 0, streamId]);
-          reject(new Error('Pre-encoding failed'));
-        }
+        const proc = spawn('ffmpeg', args);
+        proc.stderr.on('data', (data) => {
+          const msg = data.toString();
+          const timeMatch = msg.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
+          if (timeMatch && duration > 0) {
+            const secs = parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseFloat(timeMatch[3]);
+            const progress = Math.min(99, Math.round((secs / duration) * 100));
+            pool.query('UPDATE streams SET encode_progress=$1 WHERE id=$2', [progress, streamId]).catch(() => {});
+          }
+        });
+        proc.on('close', async (code) => {
+          if (code === 0 && fs.existsSync(encodedFile)) {
+            await pool.query('UPDATE streams SET encoded_path=$1, encode_status=$2, encode_progress=$3 WHERE id=$4', [encodedFile, 'ready', 100, streamId]);
+            resolve(encodedFile);
+          } else {
+            await pool.query('UPDATE streams SET encode_status=$1, encode_progress=$2 WHERE id=$3', ['failed', 0, streamId]);
+            reject(new Error('Pre-encoding failed'));
+          }
+        });
       });
     });
-  });
+  } finally {
+    encodingJobs--;
+  }
 }
 
 // ==================== FFMPEG (DRIFT FIX) ====================
