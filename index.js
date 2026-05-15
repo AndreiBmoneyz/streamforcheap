@@ -1562,13 +1562,39 @@ function uploadXHR(url, file) {
 
 async function startStream(id) {
   var btn = document.querySelector('#stream-' + id + ' .btn-start');
-  if (btn) { btn.textContent = '⏳ Starting...'; btn.disabled = true; }
+  if (btn) { btn.disabled = true; btn.title = 'Please wait a few seconds, stream is processing'; }
   try {
     var res = await fetch('/api/streams/' + id + '/start', { method: 'POST' });
     var data = await res.json();
-    if (data.error) { alert(data.error); location.reload(); return; }
+    if (data.error) {
+      if (data.error.includes('processing') || data.error.includes('still')) {
+        animateDots(btn);
+        setTimeout(function() {
+          if (btn) { btn.disabled = false; btn.textContent = '▶ Start stream'; btn.title = ''; }
+        }, 5000);
+      } else {
+        if (btn) { btn.disabled = false; btn.textContent = '▶ Start stream'; btn.title = ''; }
+        alert(data.error);
+      }
+      return;
+    }
     location.reload();
-  } catch(e) { alert('Failed to start stream.'); location.reload(); }
+  } catch(e) { 
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Start stream'; btn.title = ''; }
+    alert('Failed to start stream.'); 
+  }
+}
+
+function animateDots(btn) {
+  if (!btn) return;
+  var dots = ['.', '..', '...'];
+  var i = 0;
+  btn.textContent = 'Processing stream.';
+  var interval = setInterval(function() {
+    if (!btn.disabled) { clearInterval(interval); return; }
+    i = (i + 1) % dots.length;
+    btn.textContent = 'Processing stream' + dots[i];
+  }, 500);
 }
 
 (function pollEncoding() {
